@@ -1,6 +1,6 @@
 [package]
 name = "zastava-proxy"
-description = "Zastava MCP wiring: rmcp server+client, downstream spawn/lifecycle, routing. Lands in M1."
+description = "Zastava MCP wiring: rmcp server+client, downstream spawn/lifecycle, routing."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,3 +10,16 @@ authors.workspace = true
 
 [dependencies]
 zastava-core.workspace = true
+rmcp.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+schemars = "1"
+thiserror.workspace = true
+tracing.workspace = true
+notify.workspace = true
+
+process-wrap = { version = "9.1", features = ["tokio1", "job-object", "kill-on-drop", "process-session"] }
+
+[dev-dependencies]
+tempfile = "3"

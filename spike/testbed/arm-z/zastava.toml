@@ -1,0 +1,10 @@
+[servers.alpha]
+command = "C:/path/to/zastava/target/debug/zastava-test-echo.exe"
+env = { ECHO_FIXTURE_NAME = "alpha" }
+
+[servers.beta]
+command = "C:/path/to/zastava/target/debug/zastava-test-echo.exe"
+env = { ECHO_FIXTURE_NAME = "beta" }
+
+[log]
+path = "C:/path/to/zastava/spike/testbed/arm-z/calls.jsonl"

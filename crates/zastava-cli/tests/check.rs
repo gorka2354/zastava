@@ -61,12 +61,18 @@ fn check_rejects_missing_file() {
 }
 
 #[test]
-fn run_is_honest_about_m1() {
+fn annotate_is_honest_about_m3() {
     let (_dir, path) = write_config(VALID);
     Command::cargo_bin("zastava")
         .unwrap()
-        .args(["--config", path.to_str().unwrap(), "run"])
+        .args([
+            "--config",
+            path.to_str().unwrap(),
+            "annotate",
+            "ev-1",
+            "полезно",
+        ])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("M1"));
+        .stderr(predicate::str::contains("M3"));
 }

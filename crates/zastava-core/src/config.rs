@@ -30,6 +30,39 @@ pub struct Config {
     /// Настройки журнала вызовов.
     #[serde(default)]
     pub log: LogConfig,
+    /// Настройки самого гейтвея (таймауты).
+    #[serde(default)]
+    pub proxy: ProxyConfig,
+}
+
+/// Секция `[proxy]`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProxyConfig {
+    /// Таймаут одного downstream-вызова, мс. Зависший downstream не должен
+    /// вешать весь гейтвей (контракт падения, решение 2A).
+    #[serde(default = "default_call_timeout_ms")]
+    pub call_timeout_ms: u64,
+    /// Таймаут initialize-хендшейка с downstream при старте, мс.
+    #[serde(default = "default_initialize_timeout_ms")]
+    pub initialize_timeout_ms: u64,
+}
+
+impl Default for ProxyConfig {
+    fn default() -> Self {
+        Self {
+            call_timeout_ms: default_call_timeout_ms(),
+            initialize_timeout_ms: default_initialize_timeout_ms(),
+        }
+    }
+}
+
+fn default_call_timeout_ms() -> u64 {
+    60_000
+}
+
+fn default_initialize_timeout_ms() -> u64 {
+    15_000
 }
 
 /// Один downstream-сервер (stdio; url-транспорт — вне v0.1).
@@ -195,6 +228,13 @@ impl Config {
                     rule.sig
                 )),
             }
+        }
+
+        if self.proxy.call_timeout_ms == 0 {
+            problems.push("proxy.call_timeout_ms must be > 0".to_string());
+        }
+        if self.proxy.initialize_timeout_ms == 0 {
+            problems.push("proxy.initialize_timeout_ms must be > 0".to_string());
         }
 
         if problems.is_empty() {

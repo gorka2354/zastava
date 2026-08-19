@@ -1,0 +1,286 @@
+//! E2E-тесты реального бинаря `zastava run` с реальным дочерним процессом:
+//! stdout-чистота (CI-тест из T6.12), EOF-уборка детей, deny-поток,
+//! import из .claude.json.
+
+use std::io::{BufRead, BufReader, Write};
+use std::process::{Child, Command, Stdio};
+use std::time::Duration;
+
+const INIT: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"e2e","version":"0"}}}"#;
+const INITIALIZED: &str = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
+const LIST: &str = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#;
+
+fn fixture_path() -> &'static str {
+    env!("CARGO_BIN_EXE_zastava-test-echo")
+}
+
+fn zastava_path() -> &'static str {
+    env!("CARGO_BIN_EXE_zastava")
+}
+
+/// Пишет конфиг с одной фикстурой `alpha` и заданной секцией policy.
+fn write_config(dir: &tempfile::TempDir, policy: &str, pid_file: Option<&Path>) -> PathBuf {
+    let mut env_line = String::from("env = { ECHO_FIXTURE_NAME = \"alpha\"");
+    if let Some(pid) = pid_file {
+        env_line.push_str(&format!(
+            ", ECHO_FIXTURE_PID_FILE = {:?}",
+            pid.to_string_lossy()
+        ));
+    }
+    env_line.push_str(" }");
+    let content = format!(
+        "[servers.alpha]\ncommand = {:?}\n{env_line}\n\n{policy}",
+        fixture_path()
+    );
+    let path = dir.path().join("zastava.toml");
+    std::fs::write(&path, content).unwrap();
+    path
+}
+
+use std::path::{Path, PathBuf};
+
+struct RunningZastava {
+    child: Child,
+    stdout: BufReader<std::process::ChildStdout>,
+}
+
+fn start_run(config: &Path, extra: &[&str]) -> RunningZastava {
+    let mut child = Command::new(zastava_path())
+        .args(["--config", config.to_str().unwrap(), "run"])
+        .args(extra)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn zastava run");
+    let stdout = BufReader::new(child.stdout.take().unwrap());
+    RunningZastava { child, stdout }
+}
+
+impl RunningZastava {
+    fn send(&mut self, line: &str) {
+        let stdin = self.child.stdin.as_mut().unwrap();
+        writeln!(stdin, "{line}").unwrap();
+        stdin.flush().unwrap();
+    }
+
+    fn read_line(&mut self) -> String {
+        let mut line = String::new();
+        self.stdout.read_line(&mut line).expect("read stdout line");
+        line
+    }
+
+    fn close_stdin(&mut self) {
+        drop(self.child.stdin.take());
+    }
+}
+
+impl Drop for RunningZastava {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn pid_alive(pid: u32) -> bool {
+    #[cfg(windows)]
+    {
+        let out = Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+            .output()
+            .expect("tasklist");
+        String::from_utf8_lossy(&out.stdout).contains(&pid.to_string())
+    }
+    #[cfg(unix)]
+    {
+        Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+}
+
+#[test]
+fn stdout_is_pure_jsonrpc_and_tools_are_namespaced() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_config(&dir, "", None);
+    let mut z = start_run(&config, &[]);
+
+    z.send(INIT);
+    let init_line = z.read_line();
+    // stdout-дисциплина: каждая строка — валидный JSON-RPC, ни байта мусора.
+    let parsed: serde_json::Value =
+        serde_json::from_str(init_line.trim()).expect("stdout line must be pure JSON");
+    assert_eq!(parsed["jsonrpc"], "2.0");
+
+    z.send(INITIALIZED);
+    z.send(LIST);
+    let list_line = z.read_line();
+    let listed: serde_json::Value = serde_json::from_str(list_line.trim()).unwrap();
+    let names = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert!(names.contains(&"alpha__ping".to_string()), "{names:?}");
+}
+
+#[test]
+fn eof_kills_downstream_children() {
+    let dir = tempfile::tempdir().unwrap();
+    let pid_file = dir.path().join("child.pid");
+    let config = write_config(&dir, "", Some(&pid_file));
+    let mut z = start_run(&config, &[]);
+
+    z.send(INIT);
+    let _ = z.read_line();
+    z.send(INITIALIZED);
+
+    // Ждём pid-файл фикстуры.
+    let mut child_pid = None;
+    for _ in 0..100 {
+        if let Ok(content) = std::fs::read_to_string(&pid_file) {
+            if let Ok(pid) = content.trim().parse::<u32>() {
+                child_pid = Some(pid);
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let child_pid = child_pid.expect("fixture must write its pid");
+    assert!(pid_alive(child_pid), "фикстура должна быть жива");
+
+    // EOF от клиента → гейтвей завершает работу и убирает детей.
+    z.close_stdin();
+    let _ = z.child.wait();
+
+    let mut dead = false;
+    for _ in 0..100 {
+        if !pid_alive(child_pid) {
+            dead = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        dead,
+        "после EOF не должно оставаться сирот (pid {child_pid})"
+    );
+}
+
+#[test]
+fn enforce_denies_and_reports_rule_hint() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_config(
+        &dir,
+        "[policy]\nmode = \"enforce\"\ndefault = \"deny\"\n",
+        None,
+    );
+    let mut z = start_run(&config, &[]);
+
+    z.send(INIT);
+    let _ = z.read_line();
+    z.send(INITIALIZED);
+    z.send(r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"alpha__ping","arguments":{"message":"hi"}}}"#);
+    let reply: serde_json::Value = serde_json::from_str(z.read_line().trim()).unwrap();
+    assert_eq!(reply["result"]["isError"], true);
+    let text = reply["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("denied by zastava"), "{text}");
+    assert!(text.contains("zastava allow alpha__ping"), "{text}");
+}
+
+#[test]
+fn passthrough_flag_bypasses_enforce() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_config(
+        &dir,
+        "[policy]\nmode = \"enforce\"\ndefault = \"deny\"\n",
+        None,
+    );
+    let mut z = start_run(&config, &["--passthrough"]);
+
+    z.send(INIT);
+    let _ = z.read_line();
+    z.send(INITIALIZED);
+    z.send(r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"alpha__ping","arguments":{"message":"free"}}}"#);
+    let reply: serde_json::Value = serde_json::from_str(z.read_line().trim()).unwrap();
+    let text = reply["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("pong: free"), "{text}");
+}
+
+#[test]
+fn import_converts_claude_json_to_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let claude_json = dir.path().join(".claude.json");
+    std::fs::write(
+        &claude_json,
+        r#"{
+          "mcpServers": {
+            "github": { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-github"], "env": { "TOKEN": "x" } },
+            "notion": { "type": "http", "url": "https://mcp.notion.com/mcp" }
+          }
+        }"#,
+    )
+    .unwrap();
+    let target = dir.path().join("zastava.toml");
+
+    let output = Command::new(zastava_path())
+        .args([
+            "--config",
+            target.to_str().unwrap(),
+            "import",
+            "--from",
+            claude_json.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Импортировано серверов: 1"), "{stdout}");
+    assert!(stdout.contains("пропущен: notion"), "{stdout}");
+
+    let written = std::fs::read_to_string(&target).unwrap();
+    assert!(written.contains("[servers.github]"), "{written}");
+    assert!(written.contains("TOKEN"), "{written}");
+
+    // Повторный импорт без --force обязан отказать (не затираем молча).
+    let second = Command::new(zastava_path())
+        .args([
+            "--config",
+            target.to_str().unwrap(),
+            "import",
+            "--from",
+            claude_json.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!second.status.success(), "без --force перезапись запрещена");
+}
+
+#[test]
+fn allow_appends_rule_and_check_sees_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_config(&dir, "# комментарий юзера — должен пережить allow\n", None);
+
+    let output = Command::new(zastava_path())
+        .args(["--config", config.to_str().unwrap(), "allow", "alpha__ping"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+
+    let written = std::fs::read_to_string(&config).unwrap();
+    assert!(
+        written.contains("# комментарий юзера"),
+        "комментарии не трогаем"
+    );
+    assert!(written.contains("sig = \"alpha__ping\""));
+
+    // Неизвестный сервер — отказ.
+    let bad = Command::new(zastava_path())
+        .args(["--config", config.to_str().unwrap(), "allow", "ghost__x"])
+        .output()
+        .unwrap();
+    assert!(!bad.status.success());
+}

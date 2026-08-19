@@ -1,0 +1,5 @@
+{
+  "mcpServers": {
+    "zastava": { "command": "C:/path/to/zastava/target/debug/zastava.exe", "args": ["--config", "C:/path/to/zastava/spike/testbed/arm-z/zastava.toml", "run"] }
+  }
+}
