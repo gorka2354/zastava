@@ -20,8 +20,22 @@ single-binary MCP-гейтвей, который агрегирует ваши M
 - [x] Spike: rmcp server+client в одном процессе, агрегация, неймспейсинг,
       живой Claude Code через прокси (`spike/`)
 - [x] M0: workspace, `zastava check` (fail-closed конфиг), CI win+linux
-- [ ] M1: прокси + журнал + `stats`/`allow`/`import`
+- [x] M1: рабочий гейтвей — агрегация с неймспейсингом, policy-пайплайн
+      (warn/enforce), аудит-журнал, живой reload правил, `stats` / `allow` /
+      `learn` / `import` / `--passthrough`. Пройдено два независимых
+      adversarial-ревью (3 P1 + 11 P2 закрыты с регрессионными тестами).
 - [ ] M2-lite → M3 (аргументные матчеры + learn) → M2-full → M4 (release)
+
+## Попробовать
+
+```bash
+cargo build
+zastava import                  # перенести серверы из .claude.json
+zastava check                   # валидация конфига и план политик
+# в клиенте: {"mcpServers": {"zastava": {"command": "zastava", "args": ["run"]}}}
+zastava stats                   # что происходило
+zastava learn                   # черновики правил из наблюдений
+```
 
 План: `inc/` (локально). Дизайн: `docs/designs/zastava-mcp-gateway.md`.
 
