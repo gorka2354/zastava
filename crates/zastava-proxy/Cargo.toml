@@ -1,0 +1,12 @@
+[package]
+name = "zastava-proxy"
+description = "Zastava MCP wiring: rmcp server+client, downstream spawn/lifecycle, routing. Lands in M1."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+zastava-core.workspace = true
