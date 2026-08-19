@@ -47,10 +47,11 @@ impl ServerHandler for Proxy {
                 tools.push(tool);
             }
         }
-        Ok(ListToolsResult {
-            tools,
-            ..Default::default()
-        })
+        // Протокол 2026-07-28 требует ttlMs/cacheScope при наличии resultType:
+        // отдаём некэшируемый приватный результат.
+        Ok(ListToolsResult::with_all_items(tools)
+            .with_ttl_ms(0)
+            .with_cache_scope(rmcp::model::CacheScope::Private))
     }
 
     async fn call_tool(
@@ -68,10 +69,13 @@ impl ServerHandler for Proxy {
         eprintln!("[proxy] forwarding {full_name}");
         let mut downstream_req = request;
         downstream_req.name = tool.to_string().into();
-        let result = ds
+        let mut result = ds
             .call_tool(downstream_req)
             .await
             .map_err(|e| ErrorData::internal_error(format!("forward failed: {e}"), None))?;
+        // Downstream мог договориться о старой версии протокола и очистить
+        // resultType; клиент на 2026-07-28 требует его — восстанавливаем.
+        result.result_type = Some(rmcp::model::ResultType::COMPLETE);
         Ok(result.into())
     }
 }
