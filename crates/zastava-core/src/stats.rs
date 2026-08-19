@@ -22,6 +22,10 @@ pub struct StatsSummary {
     pub denies: u64,
     /// Ошибочных вызовов (включая таймауты).
     pub errors: u64,
+    /// Вызовов, брошенных по таймауту (побочный эффект мог состояться).
+    pub abandoned: u64,
+    /// Маркеров-событий гейтвея (старт, отключение аудита, ротация).
+    pub markers: u64,
 }
 
 impl StatsSummary {
@@ -37,7 +41,14 @@ pub fn summarize(records: &[CallRecord]) -> StatsSummary {
     let mut seen: BTreeSet<String> = BTreeSet::new();
 
     for record in records {
+        if !record.is_call() {
+            summary.markers += 1;
+            continue;
+        }
         summary.total += 1;
+        if record.abandoned {
+            summary.abandoned += 1;
+        }
         *summary.per_server.entry(record.server.clone()).or_default() += 1;
         if record.decision == "deny" {
             summary.denies += 1;
@@ -61,23 +72,14 @@ pub fn summarize(records: &[CallRecord]) -> StatsSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
 
     fn record(server: &str, tool: &str, decision: &str, is_error: bool) -> CallRecord {
         CallRecord {
-            ts: String::new(),
-            id: String::new(),
             server: server.into(),
             tool: tool.into(),
-            canonical_subset: BTreeMap::new(),
-            canon_version: 0,
-            args_hash: String::new(),
             decision: decision.into(),
-            enforced: false,
-            matched_rule: None,
-            duration_ms: 0,
-            result_bytes: 0,
             is_error,
+            ..Default::default()
         }
     }
 
@@ -99,6 +101,17 @@ mod tests {
         assert_eq!(s.denies, 1);
         assert_eq!(s.errors, 1);
         assert_eq!(s.repeat_ratio(), Some(0.4));
+    }
+
+    #[test]
+    fn markers_do_not_pollute_call_stats() {
+        let records = vec![
+            CallRecord::marker("t".into(), "id".into(), "audit_disabled", None),
+            record("a", "ping", "allow", false),
+        ];
+        let s = summarize(&records);
+        assert_eq!(s.total, 1, "маркер — не вызов");
+        assert_eq!(s.markers, 1);
     }
 
     #[test]

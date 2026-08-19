@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error::ConfigError;
 
@@ -16,7 +16,7 @@ use crate::error::ConfigError;
 pub const NS_SEP: &str = "__";
 
 /// Корень конфига (`zastava.toml`).
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     /// Downstream MCP-серверы, которые застава агрегирует.
@@ -36,7 +36,7 @@ pub struct Config {
 }
 
 /// Секция `[proxy]`.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProxyConfig {
     /// Таймаут одного downstream-вызова, мс. Зависший downstream не должен
@@ -66,25 +66,25 @@ fn default_initialize_timeout_ms() -> u64 {
 }
 
 /// Один downstream-сервер (stdio; url-транспорт — вне v0.1).
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     /// Исполняемый файл (на Windows npx-серверы запускаются через `cmd /c` —
     /// этим занимается proxy-слой, в конфиге пишется как в клиентах).
     pub command: String,
     /// Аргументы команды.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
     /// Переменные окружения процесса.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
     /// Рабочая директория процесса.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
 }
 
 /// Режим применения политик.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PolicyMode {
     /// Логировать срабатывания, но не блокировать. Дефолт до M3:
@@ -97,7 +97,7 @@ pub enum PolicyMode {
 }
 
 /// Действие по умолчанию для вызова, не покрытого ни одним правилом.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DefaultAction {
     /// Deny-by-default — security-питч проекта.
@@ -108,7 +108,7 @@ pub enum DefaultAction {
 }
 
 /// Секция `[policy]`.
-#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PolicyConfig {
     /// Режим: warn (дефолт) | enforce.
@@ -123,7 +123,7 @@ pub struct PolicyConfig {
 }
 
 /// Одно allow-правило.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuleConfig {
     /// Сигнатура: `<server>__<tool>` или `<server>__*`.
@@ -135,7 +135,7 @@ pub struct RuleConfig {
 }
 
 /// Секция `[log]`.
-#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct LogConfig {
     /// Путь к JSONL-журналу; по умолчанию — рядом с данными приложения
@@ -245,18 +245,30 @@ impl Config {
     }
 }
 
+/// Символы, допустимые в именах серверов и инструментов. Whitelist, а не
+/// blacklist: сигнатура попадает в TOML-конфиг (`zastava allow`) и в текст
+/// ошибок, поэтому кавычки, переводы строк и скобки должны быть невозможны
+/// в принципе, а не отфильтрованы на месте использования.
+pub fn is_name_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.'
+}
+
 /// Разбирает текстовую сигнатуру правила. Сплит по ПЕРВОМУ `__`: имя
 /// инструмента справа может содержать `__` (инструменты downstream'ов этого
 /// не запрещают), имя сервера — нет (валидируется отдельно).
+///
+/// Имя инструмента — либо `*`, либо набор [A-Za-z0-9_.-]. Инструмент с иными
+/// символами правилом покрыть нельзя (fail-closed: лучше отказать, чем
+/// пустить недоверенное имя в конфиг).
 pub fn parse_sig(sig: &str) -> Option<RuleSig<'_>> {
     let (server, tool) = sig.split_once(NS_SEP)?;
     if server.is_empty() || tool.is_empty() {
         return None;
     }
-    if server.contains('*') {
+    if !server.chars().all(is_name_char) {
         return None;
     }
-    if tool != "*" && tool.contains('*') {
+    if tool != "*" && !tool.chars().all(is_name_char) {
         return None;
     }
     Some(RuleSig { server, tool })
@@ -381,6 +393,15 @@ log_args = false
         assert!(parse_sig("a__").is_none());
         assert!(parse_sig("a__pre*").is_none(), "частичные wildcard — не v0");
         assert!(parse_sig("*__x").is_none());
+        // Инъекция TOML через сигнатуру: кавычки и переводы строк невозможны.
+        assert!(parse_sig(
+            "a__ping\"
+[[policy.allow]]
+sig = \"a__evil"
+        )
+        .is_none());
+        assert!(parse_sig("a__ping evil").is_none(), "пробелы недопустимы");
+        assert!(parse_sig("a__ping#").is_none(), "комментарий недопустим");
     }
 
     fn assert_invalid_contains(err: &ConfigError, needle: &str) {

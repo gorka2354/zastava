@@ -1,15 +1,31 @@
 //! Мелкие утилиты proxy-слоя.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 static EVENT_COUNTER: AtomicU64 = AtomicU64::new(0);
+static PROCESS_TAG: OnceLock<String> = OnceLock::new();
+
+/// Метка процесса: pid + момент старта. Только pid недостаточно — ОС их
+/// переиспользует, счётчик обнуляется при рестарте, а журнал общий и вечный,
+/// поэтому два разных вызова получали один id (находка ревью M1) и
+/// `zastava annotate <id>` стал бы неоднозначным.
+fn process_tag() -> &'static str {
+    PROCESS_TAG.get_or_init(|| {
+        let started = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        format!("{:x}{:x}", std::process::id(), started)
+    })
+}
 
 /// Короткий идентификатор события журнала: уникален в пределах машины
-/// (pid + счётчик), пригоден для `zastava annotate`.
+/// (pid + старт процесса + счётчик), пригоден для `zastava annotate`.
 pub fn next_event_id() -> String {
     let n = EVENT_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("ev-{:x}-{n:04}", std::process::id())
+    format!("ev-{}-{n:04}", process_tag())
 }
 
 /// Текущий момент в RFC 3339 (UTC, миллисекунды). Без внешних зависимостей:
@@ -68,5 +84,17 @@ mod tests {
         let b = next_event_id();
         assert_ne!(a, b);
         assert!(a.starts_with("ev-"));
+    }
+
+    #[test]
+    fn process_tag_mixes_pid_and_start_time() {
+        // Только pid недостаточно: ОС их переиспользует между запусками.
+        let tag = process_tag();
+        let pid_only = format!("{:x}", std::process::id());
+        assert!(tag.starts_with(&pid_only));
+        assert!(
+            tag.len() > pid_only.len(),
+            "в метке должен быть ещё и момент старта: {tag}"
+        );
     }
 }

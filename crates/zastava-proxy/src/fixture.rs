@@ -57,6 +57,30 @@ impl EchoFixture {
 #[tool_handler]
 impl ServerHandler for EchoFixture {}
 
+/// Фикстура, зависающая на `tools/list`: моделирует downstream, который
+/// прошёл initialize, а потом замолчал (ждёт сеть, OAuth, песочницу).
+#[derive(Clone)]
+pub struct HangingFixture;
+
+impl rmcp::ServerHandler for HangingFixture {
+    fn get_info(&self) -> rmcp::model::ServerInfo {
+        let mut info = rmcp::model::ServerInfo::default();
+        info.capabilities = rmcp::model::ServerCapabilities::builder()
+            .enable_tools()
+            .build();
+        info
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> Result<rmcp::model::ListToolsResult, rmcp::model::ErrorData> {
+        std::future::pending::<()>().await;
+        unreachable!("pending future never resolves")
+    }
+}
+
 /// Точка входа бинаря фикстуры: stdio-сервер до EOF клиента.
 pub async fn run_echo_fixture_stdio() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let name = std::env::var("ECHO_FIXTURE_NAME").unwrap_or_else(|_| "echo".to_string());

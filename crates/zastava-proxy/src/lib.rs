@@ -67,13 +67,36 @@ pub async fn run(config: Config, options: RunOptions) -> Result<(), ProxyError> 
     }
 
     let policy = Arc::new(RwLock::new(PolicyEngine::from_config(&config.policy)));
-    let log = if options.passthrough {
-        None
-    } else {
-        options
-            .log_path
-            .map(|path| logger::start(path, logger::DEFAULT_MAX_LOG_BYTES))
-    };
+
+    // Журнал ведётся ВСЕГДА, в том числе в passthrough: «контроль отключён»
+    // и «вызовов не было» обязаны различаться при чтении журнала постфактум
+    // (находка ревью M1 — иначе достаточно ZASTAVA_DISABLE=1 в чужом
+    // .mcp.json, чтобы работа стала неаудируемой и это осталось незаметным).
+    let log = options
+        .log_path
+        .map(|path| logger::start(path, logger::DEFAULT_MAX_LOG_BYTES));
+    if let Some(log) = &log {
+        let detail = if options.passthrough {
+            Some("policy disabled: --passthrough or ZASTAVA_DISABLE=1".to_string())
+        } else {
+            Some(format!(
+                "policy active: mode={:?}, rules={}",
+                config.policy.mode,
+                config.policy.allow.len()
+            ))
+        };
+        let event = if options.passthrough {
+            "policy_disabled"
+        } else {
+            "gateway_started"
+        };
+        log.write(zastava_core::CallRecord::marker(
+            util::now_rfc3339(),
+            util::next_event_id(),
+            event,
+            detail,
+        ));
+    }
     let _watch_guard = options
         .config_path
         .filter(|_| !options.passthrough)

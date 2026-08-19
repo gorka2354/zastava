@@ -6,16 +6,29 @@
 //!
 //! Уроки спайка (ревизия протокола 2026-07-28): paginated-результатам нужны
 //! ttlMs/cacheScope, форварднутому tools/call — восстановленный resultType.
+//!
+//! Уроки ревью M1:
+//! - `tools/list` каждого downstream идёт с таймаутом и постраничным обходом
+//!   (`list_all_tools`), иначе один молчащий сервер отрубает выдачу ВСЕХ, а
+//!   инструменты за первой страницей молча исчезают;
+//! - форвард вызова идёт отменяемым запросом: по таймауту downstream получает
+//!   `notifications/cancelled`, а запись журнала помечается `abandoned` —
+//!   «мы перестали ждать», а не «вызова не было»;
+//! - отказ клиенту сухой, рецепт разблокировки — человеку в stderr: подсказку
+//!   читает модель, которой отказали, и это готовая инструкция обхода.
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorData,
-    ListToolsResult, PaginatedRequestParams, ResultType, ServerCapabilities, ServerInfo,
+    CallToolRequest, CallToolRequestParams, CallToolResponse, CallToolResult, ClientRequest,
+    ContentBlock, ErrorData, Implementation, ListToolsResult, PaginatedRequestParams, ResultType,
+    ServerCapabilities, ServerInfo, ServerResult,
 };
-use rmcp::service::{RequestContext, RoleClient, RoleServer, RunningService};
+use rmcp::service::{
+    PeerRequestOptions, RequestContext, RoleClient, RoleServer, RunningService, ServiceError,
+};
 use rmcp::ServerHandler;
 use serde_json::{Map, Value};
 use zastava_core::config::NS_SEP;
@@ -33,6 +46,8 @@ struct CallOutcome {
     duration_ms: u64,
     result_bytes: u64,
     is_error: bool,
+    /// Мы перестали ждать ответа: побочный эффект мог состояться.
+    abandoned: bool,
 }
 
 impl CallOutcome {
@@ -41,6 +56,7 @@ impl CallOutcome {
             duration_ms: 0,
             result_bytes: 0,
             is_error: false,
+            abandoned: false,
         }
     }
     fn failed(duration_ms: u64) -> Self {
@@ -48,6 +64,15 @@ impl CallOutcome {
             duration_ms,
             result_bytes: 0,
             is_error: true,
+            abandoned: false,
+        }
+    }
+    fn abandoned(duration_ms: u64) -> Self {
+        Self {
+            duration_ms,
+            result_bytes: 0,
+            is_error: true,
+            abandoned: true,
         }
     }
 }
@@ -62,8 +87,8 @@ pub struct Gateway {
 }
 
 impl Gateway {
-    /// Собирает гейтвей. `passthrough` отключает политику и журнал —
-    /// путь отступления (T6.6 ревью).
+    /// Собирает гейтвей. `passthrough` отключает политику (но НЕ журнал —
+    /// отключённый контроль обязан оставлять след, находка ревью M1).
     pub fn new(
         downstreams: HashMap<String, DownstreamService>,
         policy: Arc<RwLock<PolicyEngine>>,
@@ -98,7 +123,7 @@ impl Gateway {
                 d.enforced,
                 d.matched_rule.clone(),
             ),
-            None => ("allow", false, None),
+            None => ("passthrough", false, None),
         };
         log.write(CallRecord {
             ts: now_rfc3339(),
@@ -114,6 +139,24 @@ impl Gateway {
             duration_ms: outcome.duration_ms,
             result_bytes: outcome.result_bytes,
             is_error: outcome.is_error,
+            abandoned: outcome.abandoned,
+            ..Default::default()
+        });
+    }
+
+    /// Отклонённый вызов тоже событие аудита: без этого перебор имён серверов
+    /// и инструментов не оставляет в журнале следа (находка ревью M1).
+    fn record_rejected(&self, server: &str, tool: &str, reason: &str) {
+        let Some(log) = &self.log else { return };
+        log.write(CallRecord {
+            ts: now_rfc3339(),
+            id: next_event_id(),
+            server: server.to_string(),
+            tool: tool.to_string(),
+            decision: "rejected".to_string(),
+            matched_rule: Some(reason.to_string()),
+            is_error: true,
+            ..Default::default()
         });
     }
 
@@ -127,6 +170,15 @@ impl ServerHandler for Gateway {
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::default();
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
+        // Иначе клиент видит нас как "rmcp" и так же пишет в свои логи.
+        info.server_info = Implementation::new("zastava", env!("CARGO_PKG_VERSION"))
+            .with_title("Zastava MCP gateway");
+        info.instructions = Some(
+            "Zastava proxies several MCP servers behind one endpoint. Tool names are \
+             prefixed with the downstream server name (`<server>__<tool>`). Calls may be \
+             denied by local policy; every decision is recorded in an audit journal."
+                .to_string(),
+        );
         info
     }
 
@@ -137,17 +189,27 @@ impl ServerHandler for Gateway {
     ) -> Result<ListToolsResult, ErrorData> {
         let mut tools = Vec::new();
         for (name, ds) in &self.downstreams {
-            // Per-server fail-closed: умерший downstream теряет свои tools,
-            // остальные продолжают работать (решение T6.12 плана).
-            match ds.list_tools(Default::default()).await {
-                Ok(listed) => {
-                    for mut tool in listed.tools {
+            // Per-server fail-closed: молчащий или упавший downstream теряет
+            // свои tools, остальные работают. Таймаут обязателен — у rmcp
+            // list_tools своего нет, и один зависший сервер иначе подвешивает
+            // выдачу инструментов всего гейтвея. list_all_tools обходит
+            // страницы: без него инструменты за первой страницей исчезают.
+            match tokio::time::timeout(self.call_timeout, ds.list_all_tools()).await {
+                Ok(Ok(listed)) => {
+                    for mut tool in listed {
                         tool.name = format!("{name}{NS_SEP}{}", tool.name).into();
                         tools.push(tool);
                     }
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     tracing::warn!(server = %name, error = %e, "tools/list failed; server excluded");
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        server = %name,
+                        timeout_ms = self.call_timeout.as_millis() as u64,
+                        "tools/list timed out; server excluded from this listing"
+                    );
                 }
             }
         }
@@ -164,12 +226,14 @@ impl ServerHandler for Gateway {
     ) -> Result<CallToolResponse, ErrorData> {
         let full_name = request.name.to_string();
         let Some((server, tool)) = full_name.split_once(NS_SEP) else {
+            self.record_rejected(&full_name, "", "tool name without namespace");
             return Err(ErrorData::invalid_params(
                 format!("tool without namespace: {full_name}"),
                 None,
             ));
         };
         let Some(ds) = self.downstreams.get(server) else {
+            self.record_rejected(server, tool, "unknown downstream server");
             return Err(ErrorData::invalid_params(
                 format!("unknown downstream: {server}"),
                 None,
@@ -194,9 +258,18 @@ impl ServerHandler for Gateway {
                     decision.as_ref(),
                     CallOutcome::blocked(),
                 );
-                tracing::info!(server, tool, "denied by policy");
+                // Рецепт разблокировки — человеку в stderr. Модели, которой
+                // отказали, готовую команду обхода не выдаём.
+                tracing::warn!(
+                    server,
+                    tool,
+                    "denied by policy; to permit run: zastava allow {}{}{}",
+                    server,
+                    NS_SEP,
+                    tool
+                );
                 return Ok(Self::tool_error(format!(
-                    "denied by zastava (rule: {}): run `zastava allow {server}{NS_SEP}{tool}` to permit",
+                    "denied by zastava policy (rule: {})",
                     d.matched_rule.as_deref().unwrap_or("default deny"),
                 )));
             }
@@ -209,27 +282,41 @@ impl ServerHandler for Gateway {
             }
         }
 
-        // Стадия форварда: зависший downstream не вешает гейтвей (2A).
+        // Стадия форварда. Отменяемый запрос с таймаутом: по истечении rmcp
+        // шлёт downstream `notifications/cancelled`. Простой drop future его
+        // не отменяет — downstream молча довёл бы побочный эффект до конца.
         let mut downstream_req = request;
         downstream_req.name = tool.to_string().into();
         let started = Instant::now();
-        let outcome = tokio::time::timeout(self.call_timeout, ds.call_tool(downstream_req)).await;
+        let mut options = PeerRequestOptions::no_options();
+        options.timeout = Some(self.call_timeout);
+        let sent = ds
+            .send_cancellable_request(
+                ClientRequest::CallToolRequest(CallToolRequest::new(downstream_req)),
+                options,
+            )
+            .await;
+        let outcome = match sent {
+            Ok(handle) => handle.await_response().await,
+            Err(e) => Err(e),
+        };
         let duration_ms = started.elapsed().as_millis() as u64;
 
         match outcome {
-            Err(_elapsed) => {
+            Err(ServiceError::Timeout { .. }) => {
                 self.record(
                     server,
                     tool,
                     &args,
                     decision.as_ref(),
-                    CallOutcome::failed(duration_ms),
+                    CallOutcome::abandoned(duration_ms),
                 );
                 Ok(Self::tool_error(format!(
-                    "downstream '{server}' timed out after {duration_ms}ms"
+                    "downstream '{server}' did not answer within {duration_ms}ms; \
+                     cancellation was sent, but the call may still have taken effect"
                 )))
             }
-            Ok(Err(e)) => {
+            Err(e) => {
                 self.record(
                     server,
                     tool,
@@ -241,14 +328,44 @@ impl ServerHandler for Gateway {
                     "downstream '{server}' failed: {e}"
                 )))
             }
-            Ok(Ok(mut result)) => {
-                // Урок спайка: downstream мог договориться о старой ревизии и
-                // очистить resultType — клиент на 2026-07-28 требует его.
-                result.result_type = Some(ResultType::COMPLETE);
-                let result_bytes = serde_json::to_string(&result)
-                    .map(|s| s.len() as u64)
-                    .unwrap_or(0);
-                let is_error = result.is_error.unwrap_or(false);
+            Ok(result) => {
+                // Релеим ответ как есть, включая input_required и task:
+                // решать их должен настоящий клиент, а не наш пустой хендлер.
+                let response = match result {
+                    ServerResult::CallToolResult(mut result) => {
+                        // Урок спайка: downstream мог договориться о старой
+                        // ревизии и очистить resultType — клиент требует его.
+                        result.result_type = Some(ResultType::COMPLETE);
+                        CallToolResponse::Complete(result)
+                    }
+                    ServerResult::InputRequiredResult(result) => {
+                        CallToolResponse::InputRequired(result)
+                    }
+                    ServerResult::CreateTaskResult(result) => CallToolResponse::Task(result),
+                    other => {
+                        self.record(
+                            server,
+                            tool,
+                            &args,
+                            decision.as_ref(),
+                            CallOutcome::failed(duration_ms),
+                        );
+                        return Ok(Self::tool_error(format!(
+                            "downstream '{server}' returned an unexpected result: {other:?}"
+                        )));
+                    }
+                };
+                // Размер меряем по завершённому результату; промежуточные
+                // ответы (input_required / task) телом не считаем.
+                let (result_bytes, is_error) = match &response {
+                    CallToolResponse::Complete(r) => (
+                        serde_json::to_string(r)
+                            .map(|s| s.len() as u64)
+                            .unwrap_or(0),
+                        r.is_error.unwrap_or(false),
+                    ),
+                    _ => (0, false),
+                };
                 self.record(
                     server,
                     tool,
@@ -258,9 +375,10 @@ impl ServerHandler for Gateway {
                         duration_ms,
                         result_bytes,
                         is_error,
+                        abandoned: false,
                     },
                 );
-                Ok(result.into())
+                Ok(response)
             }
         }
     }

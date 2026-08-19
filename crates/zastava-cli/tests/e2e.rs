@@ -171,7 +171,7 @@ fn eof_kills_downstream_children() {
 }
 
 #[test]
-fn enforce_denies_and_reports_rule_hint() {
+fn enforce_denies_without_handing_the_model_a_bypass() {
     let dir = tempfile::tempdir().unwrap();
     let config = write_config(
         &dir,
@@ -187,8 +187,11 @@ fn enforce_denies_and_reports_rule_hint() {
     let reply: serde_json::Value = serde_json::from_str(z.read_line().trim()).unwrap();
     assert_eq!(reply["result"]["isError"], true);
     let text = reply["result"]["content"][0]["text"].as_str().unwrap();
-    assert!(text.contains("denied by zastava"), "{text}");
-    assert!(text.contains("zastava allow alpha__ping"), "{text}");
+    assert!(text.contains("denied by zastava policy"), "{text}");
+    assert!(
+        !text.contains("zastava allow"),
+        "команда обхода не должна попадать в контекст модели: {text}"
+    );
 }
 
 #[test]
@@ -257,6 +260,170 @@ fn import_converts_claude_json_to_config() {
         .output()
         .unwrap();
     assert!(!second.status.success(), "без --force перезапись запрещена");
+}
+
+/// P1 ревью M1 (воспроизведён исполнением): ключ `env` из недоверенного
+/// .claude.json склеивался в TOML сырым и мог закрыть inline-таблицу, дописав
+/// собственную секцию [policy] — импорт молча выключал enforce.
+#[test]
+fn import_cannot_inject_a_policy_section() {
+    let dir = tempfile::tempdir().unwrap();
+    let claude_json = dir.path().join(".claude.json");
+    let evil_key = "A = \"1\" }\n[policy]\nmode = \"warn\"\ndefault = \"allow\"\n[[policy.allow]]\nsig = \"victim__*\"\n#";
+    let payload = serde_json::json!({
+        "mcpServers": {
+            "victim": { "command": "node", "args": ["server.js"], "env": { evil_key: "pwned" } }
+        }
+    });
+    std::fs::write(&claude_json, payload.to_string()).unwrap();
+    let target = dir.path().join("zastava.toml");
+
+    let output = Command::new(zastava_path())
+        .args([
+            "--config",
+            target.to_str().unwrap(),
+            "import",
+            "--from",
+            claude_json.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+
+    let written = std::fs::read_to_string(&target).unwrap();
+    // Секция политики не должна появиться ни при каком содержимом ключей.
+    let policy_lines: Vec<&str> = written
+        .lines()
+        .filter(|l| l.trim_start().starts_with("[policy") || l.trim_start().starts_with("[[policy"))
+        .collect();
+    assert!(
+        policy_lines.is_empty(),
+        "импорт не имеет права порождать секции политики: {policy_lines:?}\n{written}"
+    );
+
+    // И сам конфиг обязан остаться на безопасных дефолтах.
+    let check = Command::new(zastava_path())
+        .args(["--config", target.to_str().unwrap(), "check"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&check.stdout);
+    assert!(stdout.contains("mode=Warn"), "{stdout}");
+    assert!(stdout.contains("rules=0"), "{stdout}");
+}
+
+/// P2 ревью M1 (воспроизведён): sig подставлялась в TOML без валидации, и
+/// `zastava allow` дописывал произвольные правила и подменял путь журнала.
+#[test]
+fn allow_rejects_injection_in_signature() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_config(&dir, "", None);
+    let before = std::fs::read_to_string(&config).unwrap();
+
+    let evil = "alpha__ping\"\n\n[[policy.allow]]\nsig = \"alpha__everything\"\n\n[log]\npath = \"C:/Temp/decoy.jsonl\"\n#";
+    let output = Command::new(zastava_path())
+        .args(["--config", config.to_str().unwrap(), "allow", evil])
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "инъекция обязана отклоняться");
+
+    let after = std::fs::read_to_string(&config).unwrap();
+    assert_eq!(before, after, "конфиг не должен меняться при отказе");
+}
+
+/// Импорт двух имён, схлопывающихся в одно, обязан явно отказать, а не
+/// молча потерять сервер (или упасть с «internal error»).
+#[test]
+fn import_reports_name_collisions() {
+    let dir = tempfile::tempdir().unwrap();
+    let claude_json = dir.path().join(".claude.json");
+    std::fs::write(
+        &claude_json,
+        r#"{"mcpServers": {"my.server": {"command": "a"}, "my-server": {"command": "b"}}}"#,
+    )
+    .unwrap();
+    let target = dir.path().join("zastava.toml");
+    let output = Command::new(zastava_path())
+        .args([
+            "--config",
+            target.to_str().unwrap(),
+            "import",
+            "--from",
+            claude_json.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("collision"),
+        "{output:?}"
+    );
+}
+
+/// Подчёркивание валидно в именах серверов — импорт не имеет права его
+/// калечить (иначе едет весь неймспейс инструментов и клиентские правила).
+#[test]
+fn import_keeps_underscores_in_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let claude_json = dir.path().join(".claude.json");
+    std::fs::write(
+        &claude_json,
+        r#"{"mcpServers": {"claude_ai_Notion": {"command": "npx"}}}"#,
+    )
+    .unwrap();
+    let target = dir.path().join("zastava.toml");
+    Command::new(zastava_path())
+        .args([
+            "--config",
+            target.to_str().unwrap(),
+            "import",
+            "--from",
+            claude_json.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let written = std::fs::read_to_string(&target).unwrap();
+    assert!(written.contains("claude_ai_Notion"), "{written}");
+}
+
+/// «Аудит отключён» и «вызовов не было» обязаны различаться в журнале.
+#[test]
+fn passthrough_leaves_an_audit_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("calls.jsonl");
+    let policy = format!(
+        "[policy]\nmode = \"enforce\"\n\n[log]\npath = {:?}\n",
+        log_path.to_string_lossy()
+    );
+    let config = write_config(&dir, &policy, None);
+    {
+        let mut z = start_run(&config, &["--passthrough"]);
+        z.send(INIT);
+        let _ = z.read_line();
+        z.send(INITIALIZED);
+        z.close_stdin();
+        let _ = z.child.wait();
+    }
+    let journal = std::fs::read_to_string(&log_path).expect("журнал обязан существовать");
+    assert!(
+        journal.contains("policy_disabled"),
+        "отключённый контроль обязан оставлять след: {journal}"
+    );
+}
+
+/// Отсутствующий журнал ≠ пустая история.
+#[test]
+fn stats_distinguishes_missing_journal_from_empty_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("nope.jsonl");
+    let policy = format!("[log]\npath = {:?}\n", log_path.to_string_lossy());
+    let config = write_config(&dir, &policy, None);
+
+    let output = Command::new(zastava_path())
+        .args(["--config", config.to_str().unwrap(), "stats"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("ещё не создан"), "{stdout}");
 }
 
 #[test]

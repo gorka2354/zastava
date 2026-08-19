@@ -9,7 +9,7 @@ use std::time::Duration;
 use rmcp::model::{CallToolRequestParams, CallToolResult, ContentBlock};
 use rmcp::ServiceExt;
 use zastava_core::{Config, PolicyEngine};
-use zastava_proxy::fixture::EchoFixture;
+use zastava_proxy::fixture::{EchoFixture, HangingFixture};
 use zastava_proxy::gateway::{DownstreamService, Gateway};
 use zastava_proxy::logger;
 
@@ -138,8 +138,11 @@ async fn enforce_denies_uncovered_call_and_logs_it() {
         .unwrap();
     assert_eq!(result.is_error, Some(true));
     let text = text_of(&result);
-    assert!(text.contains("denied by zastava"), "{text}");
-    assert!(text.contains("zastava allow alpha__ping"), "{text}");
+    assert!(text.contains("denied by zastava policy"), "{text}");
+    assert!(
+        !text.contains("zastava allow"),
+        "рецепт обхода не должен уезжать в контекст модели: {text}"
+    );
 
     let records = wait_records(&gw.log_path, 1).await;
     assert_eq!(records[0].decision, "deny");
@@ -191,10 +194,11 @@ async fn hung_downstream_times_out_without_hanging_gateway() {
         .await
         .unwrap();
     assert_eq!(result.is_error, Some(true));
+    let text = text_of(&result);
+    assert!(text.contains("did not answer"), "{text}");
     assert!(
-        text_of(&result).contains("timed out"),
-        "{}",
-        text_of(&result)
+        text.contains("may still have taken effect"),
+        "сообщение обязано честно говорить, что побочный эффект мог случиться: {text}"
     );
 
     // Гейтвей жив: следующий быстрый вызов проходит.
@@ -235,6 +239,76 @@ async fn call_without_namespace_is_protocol_error() {
         .await
         .expect_err("без неймспейса — протокольная ошибка");
     assert!(err.to_string().contains("namespace"), "{err}");
+}
+
+/// Находка P1 ревью M1: у rmcp `list_tools` нет своего таймаута, а цикл по
+/// downstream'ам последовательный — один молчащий сервер подвешивал выдачу
+/// инструментов ВСЕГО гейтвея.
+#[tokio::test]
+async fn hung_downstream_does_not_block_tool_listing_of_others() {
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        if let Ok(running) = HangingFixture.serve(server_io).await {
+            let _ = running.waiting().await;
+        }
+    });
+    let hung = ().serve(client_io).await.expect("hung client");
+
+    let mut downstreams = HashMap::new();
+    downstreams.insert("alpha".to_string(), fixture_downstream("alpha").await);
+    downstreams.insert("hung".to_string(), hung);
+
+    let config = Config::from_toml_str(WARN_NO_RULES).unwrap();
+    let gateway = Gateway::new(
+        downstreams,
+        Arc::new(RwLock::new(PolicyEngine::from_config(&config.policy))),
+        None,
+        Duration::from_millis(300),
+        false,
+    );
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        if let Ok(running) = gateway.serve(server_io).await {
+            let _ = running.waiting().await;
+        }
+    });
+    let client = ().serve(client_io).await.unwrap();
+
+    let listed = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.list_tools(Default::default()),
+    )
+    .await
+    .expect("выдача инструментов не должна висеть из-за одного downstream")
+    .expect("list_tools");
+    let names: Vec<String> = listed.tools.iter().map(|t| t.name.to_string()).collect();
+    assert!(
+        names.iter().any(|n| n == "alpha__ping"),
+        "инструменты живого сервера обязаны доехать: {names:?}"
+    );
+    assert!(
+        !names.iter().any(|n| n.starts_with("hung__")),
+        "молчащий сервер исключается из выдачи: {names:?}"
+    );
+}
+
+/// Отклонённые вызовы (неизвестный сервер, имя без неймспейса) — тоже
+/// события аудита: без записи перебор имён невидим в журнале.
+#[tokio::test]
+async fn rejected_calls_are_recorded() {
+    let gw = gateway_with(WARN_NO_RULES, 5_000, false).await;
+    let _ = gw
+        .client
+        .call_tool(call("ghost__tool", serde_json::json!({})))
+        .await;
+    let _ = gw
+        .client
+        .call_tool(call("noseparator", serde_json::json!({})))
+        .await;
+
+    let records = wait_records(&gw.log_path, 2).await;
+    assert_eq!(records.len(), 2, "оба отказа должны быть в журнале");
+    assert!(records.iter().all(|r| r.decision == "rejected"));
 }
 
 #[tokio::test]

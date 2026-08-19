@@ -7,11 +7,11 @@
 use std::collections::BTreeSet;
 
 use crate::config::{Config, NS_SEP};
-use crate::policy::{PolicyEngine, Verdict};
+use crate::policy::PolicyEngine;
 use crate::record::CallRecord;
 
 /// Результат генерации черновиков.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct LearnOutput {
     /// Сигнатуры, встреченные в журнале и не покрытые текущими правилами.
     pub new_sigs: Vec<String>,
@@ -19,25 +19,43 @@ pub struct LearnOutput {
     pub toml_snippet: String,
     /// Готовый сниппет клиентского `permissions.allow` (per-tool, через заставу).
     pub client_allow_snippet: String,
+    /// Сигнатуры, уже покрытые правилом с аргументными матчерами. НЕ попадают
+    /// в черновик: tool-level правило поверх такого сняло бы осознанное
+    /// сужение (например, «create_issue только в repo X»).
+    pub narrowed: Vec<String>,
+    /// Сигнатуры серверов, которых нет в этом конфиге. Журнал общий на
+    /// машину, а конфиги проектные — предложить такое правило означало бы
+    /// сломать конфиг (`unknown server`) при вставке.
+    pub foreign: Vec<String>,
 }
 
-/// Строит черновики по журналу. Дедупликация — по (server, tool); покрытое
-/// существующими правилами не предлагается повторно.
+/// Строит черновики по журналу. Дедупликация — по (server, tool).
+///
+/// Три категории, и различать их обязательно (находка ревью M1, подтверждена
+/// двумя независимыми ревьюерами): покрытое tool-level правилом молчит;
+/// покрытое АРГУМЕНТНЫМ правилом уходит в `narrowed` (предложить поверх
+/// tool-level = снять сужение); вызовы к серверам не из этого конфига уходят
+/// в `foreign` (журнал общий на машину, конфиги проектные).
 pub fn suggest(records: &[CallRecord], config: &Config) -> LearnOutput {
     let engine = PolicyEngine::from_config(&config.policy);
     let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut narrowed: BTreeSet<String> = BTreeSet::new();
+    let mut foreign: BTreeSet<String> = BTreeSet::new();
 
-    for record in records {
-        // tool-level проверка покрытия: аргументы правил здесь не учитываем —
-        // learn v0 предлагает только tool-level правила.
-        let covered = matches!(
-            engine
-                .decide(&record.server, &record.tool, &serde_json::Map::new())
-                .verdict,
-            Verdict::Allow
-        );
-        if !covered {
-            seen.insert((record.server.clone(), record.tool.clone()));
+    for record in records.iter().filter(|r| r.is_call()) {
+        let sig = format!("{}{NS_SEP}{}", record.server, record.tool);
+        if !config.servers.contains_key(&record.server) {
+            foreign.insert(sig);
+            continue;
+        }
+        match engine.covering_rule(&record.server, &record.tool) {
+            Some((rule, true)) => {
+                narrowed.insert(format!("{sig} (уже сужено правилом {rule})"));
+            }
+            Some((_, false)) => {}
+            None => {
+                seen.insert((record.server.clone(), record.tool.clone()));
+            }
         }
     }
 
@@ -67,13 +85,14 @@ pub fn suggest(records: &[CallRecord], config: &Config) -> LearnOutput {
         new_sigs,
         toml_snippet,
         client_allow_snippet,
+        narrowed: narrowed.into_iter().collect(),
+        foreign: foreign.into_iter().collect(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
 
     fn record(server: &str, tool: &str) -> CallRecord {
         CallRecord {
@@ -81,15 +100,8 @@ mod tests {
             id: "e".into(),
             server: server.into(),
             tool: tool.into(),
-            canonical_subset: BTreeMap::new(),
-            canon_version: 0,
-            args_hash: String::new(),
             decision: "deny".into(),
-            enforced: false,
-            matched_rule: None,
-            duration_ms: 0,
-            result_bytes: 0,
-            is_error: false,
+            ..Default::default()
         }
     }
 
@@ -112,6 +124,42 @@ mod tests {
         assert!(out
             .client_allow_snippet
             .contains("mcp__zastava__qdrant__search"));
+    }
+
+    #[test]
+    fn never_suggests_rule_that_widens_an_argument_rule() {
+        // Находка ревью M1 (обе линзы независимо): tool-level предложение
+        // поверх правила с args сняло бы сужение по repo.
+        let config = Config::from_toml_str(
+            "[servers.github]\ncommand = \"x\"\n[[policy.allow]]\nsig = \"github__create_issue\"\nargs = { repo = \"safe/repo\" }\n",
+        )
+        .unwrap();
+        let out = suggest(&[record("github", "create_issue")], &config);
+        assert!(
+            out.new_sigs.is_empty(),
+            "предлагать tool-level поверх аргументного правила нельзя: {:?}",
+            out.new_sigs
+        );
+        assert_eq!(out.narrowed.len(), 1);
+        assert!(out.narrowed[0].contains("github__create_issue"));
+    }
+
+    #[test]
+    fn foreign_servers_are_reported_not_suggested() {
+        // Журнал общий на машину: сервер другого проекта не должен попадать
+        // в черновик, иначе вставка ломает конфиг (unknown server).
+        let config = Config::from_toml_str("[servers.a]\ncommand = \"x\"\n").unwrap();
+        let out = suggest(&[record("qdrant", "search"), record("a", "ping")], &config);
+        assert_eq!(out.new_sigs, vec!["a__ping"]);
+        assert_eq!(out.foreign, vec!["qdrant__search"]);
+    }
+
+    #[test]
+    fn markers_are_skipped() {
+        let config = Config::from_toml_str("[servers.a]\ncommand = \"x\"\n").unwrap();
+        let marker = CallRecord::marker("t".into(), "id".into(), "audit_disabled", None);
+        let out = suggest(&[marker], &config);
+        assert!(out.new_sigs.is_empty());
     }
 
     #[test]

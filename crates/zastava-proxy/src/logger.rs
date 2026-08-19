@@ -55,6 +55,13 @@ fn append_line(path: &Path, max_bytes: u64, line: &str) -> std::io::Result<()> {
     file.write_all(format!("{line}\n").as_bytes())
 }
 
+/// Сколько поколений журнала храним (`.1` … `.N`).
+///
+/// Одного `.1` мало: заблокированный вызов пишет запись, не касаясь
+/// downstream, то есть спам deny-вызовами стоит атакующему один JSON-RPC
+/// фрейм и раньше двумя ротациями стирал всю историю (находка ревью M1).
+pub const ROTATION_KEEP: u32 = 5;
+
 fn rotate_if_needed(path: &Path, max_bytes: u64) -> std::io::Result<()> {
     let size = match std::fs::metadata(path) {
         Ok(meta) => meta.len(),
@@ -63,11 +70,31 @@ fn rotate_if_needed(path: &Path, max_bytes: u64) -> std::io::Result<()> {
     if size < max_bytes {
         return Ok(());
     }
-    let rotated = path.with_extension("jsonl.1");
+    let generation = |n: u32| path.with_extension(format!("jsonl.{n}"));
+
+    // Сдвигаем поколения: самое старое уходит, остальные стареют на единицу.
+    let _ = std::fs::remove_file(generation(ROTATION_KEEP));
+    for n in (1..ROTATION_KEEP).rev() {
+        let _ = std::fs::rename(generation(n), generation(n + 1));
+    }
     // При гонке двух инстансов rename может проиграть — это не фатально:
     // проигравший просто продолжит писать в свежий файл.
-    match std::fs::rename(path, &rotated) {
-        Ok(()) => tracing::info!(to = %rotated.display(), "log rotated"),
+    match std::fs::rename(path, generation(1)) {
+        Ok(()) => {
+            tracing::info!(to = %generation(1).display(), "log rotated");
+            // Разрыв истории обязан быть виден в самом журнале.
+            let marker = zastava_core::CallRecord::marker(
+                crate::util::now_rfc3339(),
+                crate::util::next_event_id(),
+                "log_rotated",
+                Some(format!(
+                    "previous generation moved to {}",
+                    generation(1).display()
+                )),
+            );
+            let mut fresh = OpenOptions::new().create(true).append(true).open(path)?;
+            fresh.write_all(format!("{}\n", marker.to_jsonl()).as_bytes())?;
+        }
         Err(e) => tracing::warn!(error = %e, "log rotation failed"),
     }
     Ok(())
@@ -83,7 +110,6 @@ pub fn read_records(path: &Path) -> std::io::Result<Vec<CallRecord>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
 
     fn record(id: &str) -> CallRecord {
         CallRecord {
@@ -91,15 +117,10 @@ mod tests {
             id: id.into(),
             server: "s".into(),
             tool: "t".into(),
-            canonical_subset: BTreeMap::new(),
-            canon_version: 0,
-            args_hash: String::new(),
             decision: "allow".into(),
-            enforced: false,
-            matched_rule: None,
             duration_ms: 1,
             result_bytes: 2,
-            is_error: false,
+            ..Default::default()
         }
     }
 
@@ -137,7 +158,7 @@ mod tests {
     }
 
     #[test]
-    fn rotates_when_over_limit() {
+    fn rotates_when_over_limit_and_marks_the_gap() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("log.jsonl");
         std::fs::write(&path, "x".repeat(100)).unwrap();
@@ -147,6 +168,26 @@ mod tests {
             "старый отротирован"
         );
         let fresh = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(fresh, "{}\n", "новый файл начинается с новой записи");
+        assert!(
+            fresh.contains("log_rotated"),
+            "разрыв истории должен быть виден маркером: {fresh}"
+        );
+        assert!(fresh.trim_end().ends_with("{}"), "и новая запись на месте");
+    }
+
+    #[test]
+    fn keeps_several_generations() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.jsonl");
+        for _ in 0..3 {
+            std::fs::write(&path, "x".repeat(100)).unwrap();
+            append_line(&path, 50, "{}").unwrap();
+        }
+        assert!(path.with_extension("jsonl.1").exists());
+        assert!(
+            path.with_extension("jsonl.2").exists(),
+            "второе поколение не должно затираться первым"
+        );
+        assert!(path.with_extension("jsonl.3").exists());
     }
 }

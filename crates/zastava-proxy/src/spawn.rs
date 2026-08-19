@@ -63,23 +63,45 @@ fn spawn_transport(
     name: &str,
     config: &ServerConfig,
 ) -> Result<(TokioChildProcess, Option<tokio::process::ChildStderr>), ProxyError> {
-    match try_spawn(name, config, false) {
-        Ok(ok) => Ok(ok),
-        // npx/npm на Windows — .cmd: прямой спавн даёт NotFound.
-        #[cfg(windows)]
-        Err(ProxyError::Spawn { ref message, .. }) if message.contains("not found") => {
-            tracing::debug!(server = name, "direct spawn failed, retrying via cmd /c");
-            try_spawn(name, config, true)
+    let direct = try_spawn(config, false);
+    #[cfg(windows)]
+    let direct = match direct {
+        // npx/npm/любой .cmd на Windows нельзя спавнить напрямую. Матчим
+        // ErrorKind, а НЕ текст ошибки: текст локализован, и на русской
+        // Windows путь к npx.cmd давал «Системе не удается найти указанный
+        // путь», мимо прежней проверки `contains("not found")`.
+        Err(e) if needs_cmd_shim(&e, config) => {
+            tracing::debug!(server = name, error = %e, "direct spawn failed; retrying via cmd /c");
+            try_spawn(config, true)
         }
-        Err(e) => Err(e),
-    }
+        other => other,
+    };
+    direct.map_err(|e| ProxyError::Spawn {
+        server: name.to_string(),
+        message: e.to_string(),
+    })
+}
+
+/// Стоит ли повторить запуск через `cmd /c`: файл не найден (в т.ч. из-за
+/// того, что это скрипт-обёртка) либо команда — явный .cmd/.bat.
+#[cfg(windows)]
+fn needs_cmd_shim(error: &std::io::Error, config: &ServerConfig) -> bool {
+    use std::io::ErrorKind;
+    let script_ext = {
+        let lower = config.command.to_ascii_lowercase();
+        lower.ends_with(".cmd") || lower.ends_with(".bat")
+    };
+    script_ext
+        || matches!(
+            error.kind(),
+            ErrorKind::NotFound | ErrorKind::PermissionDenied | ErrorKind::InvalidInput
+        )
 }
 
 fn try_spawn(
-    name: &str,
     config: &ServerConfig,
     via_cmd: bool,
-) -> Result<(TokioChildProcess, Option<tokio::process::ChildStderr>), ProxyError> {
+) -> std::io::Result<(TokioChildProcess, Option<tokio::process::ChildStderr>)> {
     let mut cmd = if via_cmd {
         let mut c = Command::new("cmd");
         c.arg("/c").arg(&config.command).args(&config.args);
@@ -108,22 +130,55 @@ fn try_spawn(
     TokioChildProcess::builder(wrap)
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .map_err(|e| ProxyError::Spawn {
-            server: name.to_string(),
-            message: e.to_string(),
-        })
 }
 
 /// Дренаж stderr ребёнка (T6.8): не читаешь пайп → child виснет на полном
 /// буфере. Всё уходит в tracing (stderr прокси), stdout не трогаем — он
 /// принадлежит JSON-RPC.
+///
+/// Читаем БАЙТАМИ и декодируем lossy: `lines()` отдаёт `InvalidData` на
+/// невалидном UTF-8 (на русской Windows `cmd` пишет в OEM-кодировке), и
+/// прежний `while let Ok(Some(..))` на этом молча выходил из цикла — пайп
+/// переставал читаться, и ребёнок повисал ровно так, как эта функция обязана
+/// предотвращать (находка ревью M1).
+///
+/// Уровень: строки с признаками ошибки — `warn` (иначе падение downstream
+/// невидимо при дефолтном фильтре `info`), остальное — `debug`, чтобы тела
+/// запросов и токены из болтливых серверов не оседали в логах клиента.
 fn drain_stderr(name: &str, stderr: Option<tokio::process::ChildStderr>) {
+    const MAX_LINE: usize = 512;
     let Some(stderr) = stderr else { return };
     let server = name.to_string();
     tokio::spawn(async move {
-        let mut lines = BufReader::new(stderr).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            tracing::debug!(target: "downstream", server = %server, "{line}");
+        let mut reader = BufReader::new(stderr);
+        let mut buf = Vec::new();
+        loop {
+            buf.clear();
+            match reader.read_until(b'\n', &mut buf).await {
+                Ok(0) => break,
+                Ok(_) => {
+                    let decoded = String::from_utf8_lossy(&buf);
+                    let line = decoded.trim_end();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let mut shown: String = line.chars().take(MAX_LINE).collect();
+                    if line.chars().count() > MAX_LINE {
+                        shown.push('…');
+                    }
+                    let lower = shown.to_lowercase();
+                    if lower.contains("error") || lower.contains("panic") || lower.contains("fatal")
+                    {
+                        tracing::warn!(target: "downstream", server = %server, "{shown}");
+                    } else {
+                        tracing::debug!(target: "downstream", server = %server, "{shown}");
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(target: "downstream", server = %server, error = %e, "stderr closed");
+                    break;
+                }
+            }
         }
     });
 }

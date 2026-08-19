@@ -94,6 +94,18 @@ impl PolicyEngine {
         self.mode
     }
 
+    /// Есть ли правило, покрывающее пару (server, tool) на tool-уровне —
+    /// БЕЗ учёта аргументных матчеров. Нужно `learn`: правило с матчером
+    /// аргументов означает осознанное сужение, и предлагать поверх него
+    /// tool-level правило нельзя — это молча сняло бы ограничение.
+    /// Возвращает сигнатуру найденного правила и наличие у него матчеров.
+    pub fn covering_rule(&self, server: &str, tool: &str) -> Option<(&str, bool)> {
+        self.rules
+            .iter()
+            .find(|rule| rule.server == server && (rule.tool == "*" || rule.tool == tool))
+            .map(|rule| (rule.raw.as_str(), !rule.args.is_empty()))
+    }
+
     /// Решение по вызову инструмента `server`/`tool` с аргументами `args`.
     pub fn decide(&self, server: &str, tool: &str, args: &Map<String, Value>) -> Decision {
         let matched = self.rules.iter().find(|rule| {
@@ -227,6 +239,24 @@ sig = "a__*"
 "#;
         let d = engine(toml).decide("a", "ping", &Map::new());
         assert_eq!(d.matched_rule.as_deref(), Some("a__ping"));
+    }
+
+    #[test]
+    fn covering_rule_ignores_args_matchers() {
+        let toml = r#"
+[servers.github]
+command = "npx"
+[[policy.allow]]
+sig = "github__create_issue"
+args = { repo = "safe/repo" }
+"#;
+        let e = engine(toml);
+        let (sig, narrowed) = e
+            .covering_rule("github", "create_issue")
+            .expect("правило с матчером всё равно считается покрывающим");
+        assert_eq!(sig, "github__create_issue");
+        assert!(narrowed, "и помечается как суженное аргументами");
+        assert!(e.covering_rule("github", "other").is_none());
     }
 
     #[test]

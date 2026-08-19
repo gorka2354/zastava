@@ -4,12 +4,24 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
 use clap::{Parser, Subcommand};
-use zastava_core::config::parse_sig;
+use zastava_core::config::{parse_sig, ServerConfig};
 use zastava_core::Config;
+
+/// Обёртка для сериализации импортированных серверов в TOML.
+///
+/// Импорт собирает документ ЧЕРЕЗ СЕРИАЛИЗАТОР, а не склейкой строк: ключи и
+/// значения из `.claude.json` недоверенные, и склейка позволяла ключу env
+/// закрыть inline-таблицу и дописать собственную секцию `[policy]`
+/// (воспроизведено на ревью M1 — импорт молча выключал enforce).
+#[derive(serde::Serialize)]
+struct ImportDoc {
+    servers: BTreeMap<String, ServerConfig>,
+}
 
 #[derive(Parser)]
 #[command(
@@ -167,10 +179,27 @@ fn run(path: &Path, passthrough_flag: bool) -> anyhow::Result<()> {
         .context("gateway failed")
 }
 
+/// Читает журнал, различая «журнала нет» и «журнал не читается».
+///
+/// Для инструмента, чей продукт — доказательство происходившего, отсутствие
+/// файла и пустая история обязаны выглядеть по-разному, а ошибка чтения не
+/// должна маскироваться под «вызовов не было» (находка ревью M1).
+fn read_journal(log_path: &Path) -> anyhow::Result<Option<Vec<zastava_core::CallRecord>>> {
+    match zastava_proxy::logger::read_records(log_path) {
+        Ok(records) => Ok(Some(records)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("cannot read journal: {}", log_path.display())),
+    }
+}
+
 fn stats(path: &Path) -> anyhow::Result<()> {
     let config = load_config(path)?;
     let log_path = resolve_log_path(&config);
-    let records = zastava_proxy::logger::read_records(&log_path).unwrap_or_default();
+    let Some(records) = read_journal(&log_path)? else {
+        println!("Журнал ещё не создан: {}", log_path.display());
+        println!("(это НЕ то же самое, что «вызовов не было»)");
+        return Ok(());
+    };
     let summary = zastava_core::stats::summarize(&records);
 
     println!("Журнал: {}", log_path.display());
@@ -186,6 +215,15 @@ fn stats(path: &Path) -> anyhow::Result<()> {
     }
     println!("  deny-вердиктов:      {}", summary.denies);
     println!("  ошибок/таймаутов:    {}", summary.errors);
+    if summary.abandoned > 0 {
+        println!(
+            "  брошено по таймауту: {} (побочный эффект мог состояться)",
+            summary.abandoned
+        );
+    }
+    if summary.markers > 0 {
+        println!("  событий гейтвея:     {}", summary.markers);
+    }
     for (server, count) in &summary.per_server {
         println!("    {server}: {count}");
     }
@@ -243,11 +281,28 @@ fn allow(path: &Path, sig: &str) -> anyhow::Result<()> {
 fn learn(path: &Path) -> anyhow::Result<()> {
     let config = load_config(path)?;
     let log_path = resolve_log_path(&config);
-    let records = zastava_proxy::logger::read_records(&log_path).unwrap_or_default();
+    let Some(records) = read_journal(&log_path)? else {
+        println!("Журнал ещё не создан: {}", log_path.display());
+        return Ok(());
+    };
     let output = zastava_core::learn::suggest(&records, &config);
 
+    if !output.narrowed.is_empty() {
+        println!("# ⚠ Уже под аргументным правилом — расширять только осознанно:");
+        for sig in &output.narrowed {
+            println!("#   {sig}");
+        }
+        println!();
+    }
+    if !output.foreign.is_empty() {
+        println!("# ℹ Из журнала, но не из этого конфига (журнал общий на машину):");
+        for sig in &output.foreign {
+            println!("#   {sig}");
+        }
+        println!();
+    }
     if output.new_sigs.is_empty() {
-        println!("Журнал не содержит непокрытых сигнатур — предлагать нечего.");
+        println!("Непокрытых сигнатур для этого конфига нет — предлагать нечего.");
         return Ok(());
     }
     println!(
@@ -277,48 +332,65 @@ fn import(config_path: &Path, from: Option<&Path>, force: bool) -> anyhow::Resul
         bail!("{}: no top-level mcpServers object", claude_json.display());
     };
 
-    let mut toml = String::new();
-    let mut imported = 0usize;
+    let mut collected: BTreeMap<String, ServerConfig> = BTreeMap::new();
     let mut skipped = Vec::new();
+    let mut renamed = Vec::new();
     for (name, entry) in servers {
         let Some(command) = entry.get("command").and_then(|v| v.as_str()) else {
             skipped.push(format!("{name} (не stdio: нет command)"));
             continue;
         };
+        // `_` валиден в именах серверов — раньше он тоже заменялся, из-за чего
+        // my_server и my-server схлопывались в один ключ (находка ревью M1).
         let safe_name: String = name
             .chars()
             .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '-' {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
                     c
                 } else {
                     '-'
                 }
             })
             .collect();
-        toml.push_str(&format!("[servers.{safe_name}]\ncommand = {command:?}\n"));
-        if let Some(args) = entry.get("args").and_then(|v| v.as_array()) {
-            let list: Vec<String> = args
-                .iter()
-                .filter_map(|a| a.as_str().map(|s| format!("{s:?}")))
-                .collect();
-            if !list.is_empty() {
-                toml.push_str(&format!("args = [{}]\n", list.join(", ")));
-            }
+        if safe_name != *name {
+            renamed.push(format!("{name} → {safe_name}"));
         }
-        if let Some(env) = entry.get("env").and_then(|v| v.as_object()) {
-            let pairs: Vec<String> = env
-                .iter()
-                .filter_map(|(k, v)| v.as_str().map(|s| format!("{k} = {s:?}")))
-                .collect();
-            if !pairs.is_empty() {
-                toml.push_str(&format!("env = {{ {} }}\n", pairs.join(", ")));
-            }
+        let server = ServerConfig {
+            command: command.to_string(),
+            args: entry
+                .get("args")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            env: entry
+                .get("env")
+                .and_then(|v| v.as_object())
+                .map(|m| {
+                    m.iter()
+                        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            cwd: entry
+                .get("cwd")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+        };
+        if let Some(existing) = collected.insert(safe_name.clone(), server) {
+            bail!(
+                "name collision: two servers map to '{safe_name}' (one runs {:?}); \
+                 rename them in {} before importing",
+                existing.command,
+                claude_json.display()
+            );
         }
-        toml.push('\n');
-        imported += 1;
     }
 
-    if imported == 0 {
+    if collected.is_empty() {
         bail!(
             "nothing to import: no stdio servers in {}",
             claude_json.display()
@@ -331,19 +403,49 @@ fn import(config_path: &Path, from: Option<&Path>, force: bool) -> anyhow::Resul
         );
     }
 
+    let imported = collected.len();
+    let toml = toml::to_string_pretty(&ImportDoc { servers: collected })
+        .context("serializing imported servers")?;
     Config::from_toml_str(&toml).context("internal: imported config is invalid")?;
     if let Some(parent) = config_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(config_path, &toml)?;
+    write_private(config_path, &toml)?;
 
     println!(
         "Импортировано серверов: {imported} → {}",
         config_path.display()
     );
+    for s in &renamed {
+        println!("  переименован: {s}");
+    }
     for s in &skipped {
         println!("  пропущен: {s}");
     }
     println!("Дальше: `zastava check`, затем подключи заставу в клиенте.");
     Ok(())
+}
+
+/// Пишет файл с правами только для владельца там, где ОС это умеет.
+/// Импорт переносит содержимое `env` (то есть токены) во второй файл —
+/// оставлять его с umask-правами нельзя (находка ревью M1).
+fn write_private(path: &Path, content: &str) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(content.as_bytes())?;
+        return Ok(());
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, content)?;
+        Ok(())
+    }
 }
