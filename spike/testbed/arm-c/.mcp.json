@@ -1,0 +1,5 @@
+{
+  "mcpServers": {
+    "zastava": { "command": "C:/path/to/zastava/spike/target/debug/proxy.exe" }
+  }
+}

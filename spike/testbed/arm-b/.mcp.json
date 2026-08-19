@@ -1,0 +1,6 @@
+{
+  "mcpServers": {
+    "alpha": { "command": "C:/path/to/zastava/spike/target/debug/echo-server.exe", "env": { "SPIKE_NAME": "alpha" } },
+    "beta":  { "command": "C:/path/to/zastava/spike/target/debug/echo-server.exe", "env": { "SPIKE_NAME": "beta" } }
+  }
+}
