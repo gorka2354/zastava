@@ -46,6 +46,12 @@ pub struct ProxyConfig {
     /// Таймаут initialize-хендшейка с downstream при старте, мс.
     #[serde(default = "default_initialize_timeout_ms")]
     pub initialize_timeout_ms: u64,
+    /// Таймаут выдачи списка инструментов, мс. Отдельный и КОРОТКИЙ:
+    /// клиент ждёт tools/list синхронно, и бюджет вызова (десятки секунд)
+    /// здесь означал бы, что пара молчащих downstream'ов гарантированно
+    /// пересиживает таймаут клиента (находка верификации M1).
+    #[serde(default = "default_list_timeout_ms")]
+    pub list_timeout_ms: u64,
 }
 
 impl Default for ProxyConfig {
@@ -53,6 +59,7 @@ impl Default for ProxyConfig {
         Self {
             call_timeout_ms: default_call_timeout_ms(),
             initialize_timeout_ms: default_initialize_timeout_ms(),
+            list_timeout_ms: default_list_timeout_ms(),
         }
     }
 }
@@ -63,6 +70,10 @@ fn default_call_timeout_ms() -> u64 {
 
 fn default_initialize_timeout_ms() -> u64 {
     15_000
+}
+
+fn default_list_timeout_ms() -> u64 {
+    10_000
 }
 
 /// Один downstream-сервер (stdio; url-транспорт — вне v0.1).
@@ -236,6 +247,9 @@ impl Config {
         if self.proxy.initialize_timeout_ms == 0 {
             problems.push("proxy.initialize_timeout_ms must be > 0".to_string());
         }
+        if self.proxy.list_timeout_ms == 0 {
+            problems.push("proxy.list_timeout_ms must be > 0".to_string());
+        }
 
         if problems.is_empty() {
             Ok(())
@@ -245,30 +259,68 @@ impl Config {
     }
 }
 
-/// Символы, допустимые в именах серверов и инструментов. Whitelist, а не
-/// blacklist: сигнатура попадает в TOML-конфиг (`zastava allow`) и в текст
-/// ошибок, поэтому кавычки, переводы строк и скобки должны быть невозможны
-/// в принципе, а не отфильтрованы на месте использования.
+/// Символы, допустимые в именах, которые мы САМИ куда-то записываем.
+/// Whitelist, а не blacklist: сигнатура попадает в TOML-конфиг
+/// (`zastava allow`), в copy-paste сниппеты (`zastava learn`) и в вывод
+/// команд, поэтому кавычки, переводы строк и управляющие символы должны быть
+/// невозможны в принципе, а не отфильтрованы на месте использования.
 pub fn is_name_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.'
+}
+
+/// Безопасна ли сигнатура для записи в конфиг или в готовый к вставке
+/// сниппет. Проверка отделена от `parse_sig` намеренно: разбор существующего
+/// конфига должен быть терпимым (иначе правило на инструмент с непривычным
+/// символом не даёт гейтвею стартовать вообще), а вот ГЕНЕРАЦИЯ текста
+/// обязана быть строгой — именно там жила инъекция (ревью M1).
+pub fn is_safe_sig(sig: &str) -> bool {
+    match parse_sig(sig) {
+        Some(parsed) => {
+            parsed.server.chars().all(is_name_char)
+                && (parsed.tool == "*" || parsed.tool.chars().all(is_name_char))
+        }
+        None => false,
+    }
+}
+
+/// Экранирует недоверенное имя для БЕЗОПАСНОГО показа и записи в журнал:
+/// всё вне whitelist уходит в `\xNN`/`\u{NNNN}`. Возвращает пару
+/// (экранированное имя, менялось ли оно) — факт подмены обязан быть виден.
+pub fn sanitize_name(name: &str) -> (String, bool) {
+    let mut out = String::with_capacity(name.len());
+    let mut changed = false;
+    for c in name.chars() {
+        if is_name_char(c) {
+            out.push(c);
+        } else {
+            changed = true;
+            let code = c as u32;
+            if code < 0x100 {
+                out.push_str(&format!("\\x{code:02x}"));
+            } else {
+                out.push_str(&format!("\\u{{{code:x}}}"));
+            }
+        }
+    }
+    (out, changed)
 }
 
 /// Разбирает текстовую сигнатуру правила. Сплит по ПЕРВОМУ `__`: имя
 /// инструмента справа может содержать `__` (инструменты downstream'ов этого
 /// не запрещают), имя сервера — нет (валидируется отдельно).
 ///
-/// Имя инструмента — либо `*`, либо набор [A-Za-z0-9_.-]. Инструмент с иными
-/// символами правилом покрыть нельзя (fail-closed: лучше отказать, чем
-/// пустить недоверенное имя в конфиг).
+/// Структурная проверка, БЕЗ ограничения набора символов: конфиг,
+/// написанный руками под инструмент с экзотическим именем, обязан грузиться.
+/// Для путей, где мы сами что-то генерируем, есть `is_safe_sig`.
 pub fn parse_sig(sig: &str) -> Option<RuleSig<'_>> {
     let (server, tool) = sig.split_once(NS_SEP)?;
     if server.is_empty() || tool.is_empty() {
         return None;
     }
-    if !server.chars().all(is_name_char) {
+    if server.contains('*') {
         return None;
     }
-    if tool != "*" && !tool.chars().all(is_name_char) {
+    if tool != "*" && tool.contains('*') {
         return None;
     }
     Some(RuleSig { server, tool })
@@ -393,15 +445,54 @@ log_args = false
         assert!(parse_sig("a__").is_none());
         assert!(parse_sig("a__pre*").is_none(), "частичные wildcard — не v0");
         assert!(parse_sig("*__x").is_none());
-        // Инъекция TOML через сигнатуру: кавычки и переводы строк невозможны.
-        assert!(parse_sig(
-            "a__ping\"
+    }
+
+    #[test]
+    fn is_safe_sig_rejects_everything_we_would_have_to_quote() {
+        assert!(is_safe_sig("a__ping"));
+        assert!(is_safe_sig("a__*"));
+        assert!(is_safe_sig("a__tool.with-dots_and_2"));
+        // Инъекция TOML/JSON через сигнатуру: кавычки, переводы строк,
+        // комментарии и пробелы не должны считаться безопасными.
+        let injection = concat!(
+            "a__ping\"",
+            "
 [[policy.allow]]
-sig = \"a__evil"
-        )
-        .is_none());
-        assert!(parse_sig("a__ping evil").is_none(), "пробелы недопустимы");
-        assert!(parse_sig("a__ping#").is_none(), "комментарий недопустим");
+sig = ",
+            "\"a__evil"
+        );
+        assert!(!is_safe_sig(injection));
+        assert!(!is_safe_sig("a__ping evil"));
+        assert!(!is_safe_sig("a__ping#"));
+        assert!(
+            !is_safe_sig("a__пинг"),
+            "не-ASCII в генерируемый текст не пускаем"
+        );
+        assert!(!is_safe_sig("a"), "без разделителя — не сигнатура");
+    }
+
+    #[test]
+    fn parse_sig_stays_lenient_so_hand_written_configs_load() {
+        // Строгий charset в разборе означал бы, что конфиг с правилом на
+        // инструмент с непривычным символом не даёт гейтвею стартовать.
+        let parsed = parse_sig("a__странный:инструмент").expect("разбор терпим");
+        assert_eq!(parsed.server, "a");
+        assert!(
+            !is_safe_sig("a__странный:инструмент"),
+            "но записывать такое нельзя"
+        );
+    }
+
+    #[test]
+    fn sanitize_name_escapes_and_reports_change() {
+        let hostile = concat!("ping", "\n", "evil");
+        let (safe, changed) = sanitize_name(hostile);
+        assert!(changed);
+        assert!(!safe.contains('\n'), "{safe}");
+        assert!(safe.contains("\\x0a"), "перевод строки экранирован: {safe}");
+        let (untouched, changed) = sanitize_name("plain_tool-1.2");
+        assert!(!changed);
+        assert_eq!(untouched, "plain_tool-1.2");
     }
 
     fn assert_invalid_contains(err: &ConfigError, needle: &str) {

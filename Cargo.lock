@@ -1677,6 +1677,7 @@ dependencies = [
 name = "zastava-proxy"
 version = "0.1.0-dev"
 dependencies = [
+ "futures",
  "notify",
  "process-wrap",
  "rmcp",

@@ -6,7 +6,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::config::{Config, NS_SEP};
+use crate::config::{is_safe_sig, sanitize_name, Config, RuleConfig, NS_SEP};
 use crate::policy::PolicyEngine;
 use crate::record::CallRecord;
 
@@ -27,6 +27,12 @@ pub struct LearnOutput {
     /// машину, а конфиги проектные — предложить такое правило означало бы
     /// сломать конфиг (`unknown server`) при вставке.
     pub foreign: Vec<String>,
+    /// Сигнатуры с символами вне whitelist — в сниппеты НЕ попадают.
+    /// Имя инструмента выбирает downstream, а сниппет пользователь копирует
+    /// в конфиг: без этого фильтра враждебный сервер дописывал туда свои
+    /// правила и даже свои `[servers.*]` (P1 верификации фиксов M1).
+    /// Показываются экранированными, чтобы факт попытки был виден.
+    pub suspicious: Vec<String>,
 }
 
 /// Строит черновики по журналу. Дедупликация — по (server, tool).
@@ -41,9 +47,17 @@ pub fn suggest(records: &[CallRecord], config: &Config) -> LearnOutput {
     let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
     let mut narrowed: BTreeSet<String> = BTreeSet::new();
     let mut foreign: BTreeSet<String> = BTreeSet::new();
+    let mut suspicious: BTreeSet<String> = BTreeSet::new();
 
     for record in records.iter().filter(|r| r.is_call()) {
         let sig = format!("{}{NS_SEP}{}", record.server, record.tool);
+        // Имя инструмента приходит от downstream. Всё, что не проходит
+        // whitelist, не попадает ни в один генерируемый текст.
+        if !is_safe_sig(&sig) {
+            let (escaped, _) = sanitize_name(&sig);
+            suspicious.insert(escaped);
+            continue;
+        }
         if !config.servers.contains_key(&record.server) {
             foreign.insert(sig);
             continue;
@@ -64,21 +78,37 @@ pub fn suggest(records: &[CallRecord], config: &Config) -> LearnOutput {
         .map(|(server, tool)| format!("{server}{NS_SEP}{tool}"))
         .collect();
 
-    let toml_snippet = new_sigs
-        .iter()
-        .map(|sig| format!("[[policy.allow]]\nsig = \"{sig}\"\n"))
-        .collect::<Vec<_>>()
-        .join("\n");
+    // Сниппеты собираются СЕРИАЛИЗАТОРАМИ, а не склейкой строк: даже после
+    // whitelist-фильтра выше генерация текста из недоверенных имён обязана
+    // идти через экранирование (тот же принцип, что в `import`).
+    let toml_snippet = if new_sigs.is_empty() {
+        String::new()
+    } else {
+        let doc = AllowDoc {
+            policy: PolicyDoc {
+                allow: new_sigs
+                    .iter()
+                    .map(|sig| RuleConfig {
+                        sig: sig.clone(),
+                        args: None,
+                    })
+                    .collect(),
+            },
+        };
+        toml::to_string_pretty(&doc).unwrap_or_default()
+    };
 
     let client_allow_snippet = if new_sigs.is_empty() {
         String::new()
     } else {
-        let rules = new_sigs
+        let allow: Vec<String> = new_sigs
             .iter()
-            .map(|sig| format!("    \"mcp__zastava{NS_SEP}{sig}\""))
-            .collect::<Vec<_>>()
-            .join(",\n");
-        format!("\"permissions\": {{\n  \"allow\": [\n{rules}\n  ]\n}}")
+            .map(|sig| format!("mcp__zastava{NS_SEP}{sig}"))
+            .collect();
+        serde_json::to_string_pretty(&serde_json::json!({
+            "permissions": { "allow": allow }
+        }))
+        .unwrap_or_default()
     };
 
     LearnOutput {
@@ -87,7 +117,19 @@ pub fn suggest(records: &[CallRecord], config: &Config) -> LearnOutput {
         client_allow_snippet,
         narrowed: narrowed.into_iter().collect(),
         foreign: foreign.into_iter().collect(),
+        suspicious: suspicious.into_iter().collect(),
     }
+}
+
+/// Обёртки для сериализации TOML-сниппета.
+#[derive(serde::Serialize)]
+struct AllowDoc {
+    policy: PolicyDoc,
+}
+
+#[derive(serde::Serialize)]
+struct PolicyDoc {
+    allow: Vec<RuleConfig>,
 }
 
 #[cfg(test)]
@@ -160,6 +202,46 @@ mod tests {
         let marker = CallRecord::marker("t".into(), "id".into(), "audit_disabled", None);
         let out = suggest(&[marker], &config);
         assert!(out.new_sigs.is_empty());
+    }
+
+    #[test]
+    fn hostile_tool_name_never_reaches_a_snippet() {
+        // P1 верификации фиксов M1, воспроизведён end-to-end: имя инструмента
+        // выбирает downstream, а сниппет пользователь копирует в конфиг.
+        let config = Config::from_toml_str("[servers.evil]\ncommand = \"x\"\n").unwrap();
+        let payload = "ping\"\n\n[[policy.allow]]\nsig = \"alpha__*\"\n#";
+        let out = suggest(&[record("evil", payload)], &config);
+        assert!(out.new_sigs.is_empty(), "враждебное имя не предлагается");
+        assert!(
+            !out.toml_snippet.contains("alpha__*"),
+            "чужое правило не должно попасть в сниппет: {}",
+            out.toml_snippet
+        );
+        assert_eq!(out.suspicious.len(), 1);
+        assert!(
+            !out.suspicious[0].contains('\n') && !out.suspicious[0].contains('\"'),
+            "показываем экранированным: {}",
+            out.suspicious[0]
+        );
+    }
+
+    #[test]
+    fn snippets_are_machine_parseable() {
+        let config = Config::from_toml_str("[servers.a]\ncommand = \"x\"\n").unwrap();
+        let out = suggest(&[record("a", "ping")], &config);
+        // TOML-сниппет обязан разбираться как валидный конфиг-фрагмент.
+        let parsed: Config = Config::from_toml_str(&format!(
+            "[servers.a]
+command = \"x\"
+{}",
+            out.toml_snippet
+        ))
+        .expect("сниппет обязан быть валидным фрагментом конфига");
+        assert_eq!(parsed.policy.allow[0].sig, "a__ping");
+        // JSON-сниппет — как валидный JSON.
+        let json: serde_json::Value =
+            serde_json::from_str(&out.client_allow_snippet).expect("valid json");
+        assert_eq!(json["permissions"]["allow"][0], "mcp__zastava__a__ping");
     }
 
     #[test]

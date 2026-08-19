@@ -9,7 +9,7 @@ use std::time::Duration;
 use rmcp::model::{CallToolRequestParams, CallToolResult, ContentBlock};
 use rmcp::ServiceExt;
 use zastava_core::{Config, PolicyEngine};
-use zastava_proxy::fixture::{EchoFixture, HangingFixture};
+use zastava_proxy::fixture::{EchoFixture, EndlessPagingFixture, HangingFixture};
 use zastava_proxy::gateway::{DownstreamService, Gateway};
 use zastava_proxy::logger;
 
@@ -46,6 +46,7 @@ async fn gateway_with(policy_toml: &str, call_timeout_ms: u64, passthrough: bool
         Arc::new(RwLock::new(PolicyEngine::from_config(&config.policy))),
         Some(log),
         Duration::from_millis(call_timeout_ms),
+        Duration::from_millis(2_000),
         passthrough,
     );
 
@@ -195,7 +196,7 @@ async fn hung_downstream_times_out_without_hanging_gateway() {
         .unwrap();
     assert_eq!(result.is_error, Some(true));
     let text = text_of(&result);
-    assert!(text.contains("did not answer"), "{text}");
+    assert!(text.contains("stopped waiting"), "{text}");
     assert!(
         text.contains("may still have taken effect"),
         "сообщение обязано честно говорить, что побочный эффект мог случиться: {text}"
@@ -214,6 +215,10 @@ async fn hung_downstream_times_out_without_hanging_gateway() {
 
     let records = wait_records(&gw.log_path, 2).await;
     assert!(records[0].is_error, "таймаут записан как ошибка");
+    assert!(
+        records[0].abandoned,
+        "запись обязана быть помечена abandoned: вызов мог состояться"
+    );
 }
 
 #[tokio::test]
@@ -241,9 +246,85 @@ async fn call_without_namespace_is_protocol_error() {
     assert!(err.to_string().contains("namespace"), "{err}");
 }
 
-/// Находка P1 ревью M1: у rmcp `list_tools` нет своего таймаута, а цикл по
-/// downstream'ам последовательный — один молчащий сервер подвешивал выдачу
-/// инструментов ВСЕГО гейтвея.
+/// Поднимает произвольную серверную фикстуру и возвращает клиент к ней.
+async fn serve_fixture<S>(fixture: S) -> DownstreamService
+where
+    S: rmcp::ServerHandler + Send + Sync + 'static,
+{
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        if let Ok(running) = fixture.serve(server_io).await {
+            let _ = running.waiting().await;
+        }
+    });
+    ().serve(client_io).await.expect("fixture client")
+}
+
+/// Собирает гейтвей поверх готового набора downstream'ов.
+async fn gateway_over(
+    downstreams: HashMap<String, DownstreamService>,
+    list_timeout_ms: u64,
+) -> rmcp::service::RunningService<rmcp::service::RoleClient, ()> {
+    let config = Config::from_toml_str(WARN_NO_RULES).unwrap();
+    let gateway = Gateway::new(
+        downstreams,
+        Arc::new(RwLock::new(PolicyEngine::from_config(&config.policy))),
+        None,
+        Duration::from_millis(5_000),
+        Duration::from_millis(list_timeout_ms),
+        false,
+    );
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        if let Ok(running) = gateway.serve(server_io).await {
+            let _ = running.waiting().await;
+        }
+    });
+    ().serve(client_io).await.unwrap()
+}
+
+/// Инструменты за первой страницей раньше исчезали молча (P1 ревью M1).
+#[tokio::test]
+async fn paginated_downstream_yields_all_pages() {
+    let mut downstreams = HashMap::new();
+    downstreams.insert(
+        "paged".to_string(),
+        serve_fixture(zastava_proxy::fixture::PagedFixture).await,
+    );
+    let client = gateway_over(downstreams, 2_000).await;
+    let listed = client.list_tools(Default::default()).await.unwrap();
+    let names: Vec<String> = listed.tools.iter().map(|t| t.name.to_string()).collect();
+    assert!(names.contains(&"paged__page1".to_string()), "{names:?}");
+    assert!(
+        names.contains(&"paged__page2".to_string()),
+        "инструмент со ВТОРОЙ страницы обязан доехать: {names:?}"
+    );
+}
+
+/// Downstream, вечно повторяющий курсор, раньше крутил бы обход до OOM:
+/// таймаут ограничивал время, но не память (P1 верификации фиксов M1).
+#[tokio::test]
+async fn endless_pagination_is_bounded() {
+    let mut downstreams = HashMap::new();
+    downstreams.insert(
+        "endless".to_string(),
+        serve_fixture(EndlessPagingFixture).await,
+    );
+    let client = gateway_over(downstreams, 30_000).await;
+    let listed = tokio::time::timeout(
+        Duration::from_secs(20),
+        client.list_tools(Default::default()),
+    )
+    .await
+    .expect("обход обязан оборваться сам, не по таймауту теста")
+    .expect("list_tools");
+    assert!(
+        listed.tools.len() <= 2,
+        "повтор курсора обязан обрывать пагинацию сразу: {}",
+        listed.tools.len()
+    );
+}
+
 #[tokio::test]
 async fn hung_downstream_does_not_block_tool_listing_of_others() {
     let (client_io, server_io) = tokio::io::duplex(64 * 1024);
@@ -263,6 +344,7 @@ async fn hung_downstream_does_not_block_tool_listing_of_others() {
         downstreams,
         Arc::new(RwLock::new(PolicyEngine::from_config(&config.policy))),
         None,
+        Duration::from_millis(300),
         Duration::from_millis(300),
         false,
     );
@@ -330,6 +412,7 @@ async fn policy_reload_picks_up_new_rules_without_restart() {
         policy,
         None,
         Duration::from_millis(5_000),
+        Duration::from_millis(2_000),
         false,
     );
     let (client_io, server_io) = tokio::io::duplex(64 * 1024);

@@ -81,6 +81,75 @@ impl rmcp::ServerHandler for HangingFixture {
     }
 }
 
+/// Фикстура с ДВУМЯ страницами инструментов: проверяет, что гейтвей
+/// действительно обходит пагинацию, а не берёт первую страницу.
+#[derive(Clone)]
+pub struct PagedFixture;
+
+fn stub_tool(name: &str) -> rmcp::model::Tool {
+    rmcp::model::Tool::new(
+        name.to_string(),
+        "stub".to_string(),
+        std::sync::Arc::new(serde_json::Map::new()),
+    )
+}
+
+impl rmcp::ServerHandler for PagedFixture {
+    fn get_info(&self) -> rmcp::model::ServerInfo {
+        let mut info = rmcp::model::ServerInfo::default();
+        info.capabilities = rmcp::model::ServerCapabilities::builder()
+            .enable_tools()
+            .build();
+        info
+    }
+
+    async fn list_tools(
+        &self,
+        request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> Result<rmcp::model::ListToolsResult, rmcp::model::ErrorData> {
+        let cursor = request.and_then(|r| r.cursor);
+        let result = match cursor.as_deref() {
+            None => {
+                let mut r = rmcp::model::ListToolsResult::with_all_items(vec![stub_tool("page1")]);
+                r.next_cursor = Some("page2".to_string());
+                r
+            }
+            Some(_) => rmcp::model::ListToolsResult::with_all_items(vec![stub_tool("page2")]),
+        };
+        Ok(result
+            .with_ttl_ms(0)
+            .with_cache_scope(rmcp::model::CacheScope::Private))
+    }
+}
+
+/// Фикстура, бесконечно повторяющая один и тот же курсор: без ограничения
+/// числа страниц гейтвей крутил бы её до OOM (находка верификации M1).
+#[derive(Clone)]
+pub struct EndlessPagingFixture;
+
+impl rmcp::ServerHandler for EndlessPagingFixture {
+    fn get_info(&self) -> rmcp::model::ServerInfo {
+        let mut info = rmcp::model::ServerInfo::default();
+        info.capabilities = rmcp::model::ServerCapabilities::builder()
+            .enable_tools()
+            .build();
+        info
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> Result<rmcp::model::ListToolsResult, rmcp::model::ErrorData> {
+        let mut result = rmcp::model::ListToolsResult::with_all_items(vec![stub_tool("endless")]);
+        result.next_cursor = Some("same-cursor".to_string());
+        Ok(result
+            .with_ttl_ms(0)
+            .with_cache_scope(rmcp::model::CacheScope::Private))
+    }
+}
+
 /// Точка входа бинаря фикстуры: stdio-сервер до EOF клиента.
 pub async fn run_echo_fixture_stdio() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let name = std::env::var("ECHO_FIXTURE_NAME").unwrap_or_else(|_| "echo".to_string());

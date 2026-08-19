@@ -24,14 +24,14 @@ use std::time::{Duration, Instant};
 use rmcp::model::{
     CallToolRequest, CallToolRequestParams, CallToolResponse, CallToolResult, ClientRequest,
     ContentBlock, ErrorData, Implementation, ListToolsResult, PaginatedRequestParams, ResultType,
-    ServerCapabilities, ServerInfo, ServerResult,
+    ServerCapabilities, ServerInfo, ServerResult, Tool,
 };
 use rmcp::service::{
     PeerRequestOptions, RequestContext, RoleClient, RoleServer, RunningService, ServiceError,
 };
 use rmcp::ServerHandler;
 use serde_json::{Map, Value};
-use zastava_core::config::NS_SEP;
+use zastava_core::config::{sanitize_name, NS_SEP};
 use zastava_core::signature::{canonical_subset, full_args_hash, CANON_VERSION};
 use zastava_core::{CallRecord, Decision, PolicyEngine, Verdict};
 
@@ -77,14 +77,70 @@ impl CallOutcome {
     }
 }
 
+/// Собирает инструменты одного downstream'а, обходя пагинацию с потолками.
+///
+/// Свой цикл вместо `list_all_tools`: тот крутится, пока downstream отдаёт
+/// курсор, а враждебный (или просто сломанный) сервер может повторять один и
+/// тот же курсор вечно — время ограничил бы таймаут, а память нет.
+async fn list_one(name: &str, ds: &DownstreamService) -> Result<Vec<Tool>, ServiceError> {
+    let mut collected = Vec::new();
+    let mut cursor: Option<String> = None;
+    for page in 0..MAX_LIST_PAGES {
+        let mut params = PaginatedRequestParams::default();
+        params.cursor = cursor.clone();
+        let result = ds.list_tools(Some(params)).await?;
+        for mut tool in result.tools {
+            tool.name = format!("{name}{NS_SEP}{}", tool.name).into();
+            collected.push(tool);
+            if collected.len() >= MAX_TOOLS_PER_SERVER {
+                tracing::warn!(
+                    server = %name,
+                    limit = MAX_TOOLS_PER_SERVER,
+                    "downstream exceeded the tool limit; listing truncated"
+                );
+                return Ok(collected);
+            }
+        }
+        let next = result.next_cursor.map(|c| c.to_string());
+        match next {
+            None => return Ok(collected),
+            // Повтор курсора — верный признак сломанной или враждебной
+            // пагинации: дальше будет бесконечный цикл.
+            Some(next) if Some(&next) == cursor.as_ref() => {
+                tracing::warn!(server = %name, "downstream repeats its pagination cursor; listing truncated");
+                return Ok(collected);
+            }
+            Some(next) => {
+                cursor = Some(next);
+                if page + 1 == MAX_LIST_PAGES {
+                    tracing::warn!(
+                        server = %name,
+                        pages = MAX_LIST_PAGES,
+                        "downstream exceeded the page limit; listing truncated"
+                    );
+                }
+            }
+        }
+    }
+    Ok(collected)
+}
+
 /// Гейтвей: реализация ServerHandler поверх множества downstream'ов.
 pub struct Gateway {
     downstreams: HashMap<String, DownstreamService>,
     policy: Arc<RwLock<PolicyEngine>>,
     log: Option<LogHandle>,
     call_timeout: Duration,
+    list_timeout: Duration,
     passthrough: bool,
 }
+
+/// Потолки обхода пагинации downstream'а. Без них downstream, повторяющий
+/// один и тот же курсор, крутит цикл по кешу rmcp без сетевых запросов —
+/// таймаут ограничивает время, но не память (находка верификации M1: ~1.8 млн
+/// Tool-структур за секунду → OOM гейтвея).
+const MAX_LIST_PAGES: usize = 50;
+const MAX_TOOLS_PER_SERVER: usize = 2_000;
 
 impl Gateway {
     /// Собирает гейтвей. `passthrough` отключает политику (но НЕ журнал —
@@ -94,6 +150,7 @@ impl Gateway {
         policy: Arc<RwLock<PolicyEngine>>,
         log: Option<LogHandle>,
         call_timeout: Duration,
+        list_timeout: Duration,
         passthrough: bool,
     ) -> Self {
         Self {
@@ -101,6 +158,7 @@ impl Gateway {
             policy,
             log,
             call_timeout,
+            list_timeout,
             passthrough,
         }
     }
@@ -114,6 +172,11 @@ impl Gateway {
         outcome: CallOutcome,
     ) {
         let Some(log) = &self.log else { return };
+        // Имена приходят от клиента/downstream. Пишем в журнал только
+        // экранированные: иначе управляющие последовательности переписывают
+        // вывод `stats`/`learn`, где отчёт об этих же вызовах и читают.
+        let (server, server_dirty) = sanitize_name(server);
+        let (tool, tool_dirty) = sanitize_name(tool);
         let (decision_str, enforced, matched_rule) = match decision {
             Some(d) => (
                 match d.verdict {
@@ -128,9 +191,10 @@ impl Gateway {
         log.write(CallRecord {
             ts: now_rfc3339(),
             id: next_event_id(),
-            server: server.to_string(),
-            tool: tool.to_string(),
-            canonical_subset: canonical_subset(server, tool, args),
+            canonical_subset: canonical_subset(&server, &tool, args),
+            server,
+            tool,
+            name_sanitized: server_dirty || tool_dirty,
             canon_version: CANON_VERSION,
             args_hash: full_args_hash(args),
             decision: decision_str.to_string(),
@@ -148,11 +212,14 @@ impl Gateway {
     /// и инструментов не оставляет в журнале следа (находка ревью M1).
     fn record_rejected(&self, server: &str, tool: &str, reason: &str) {
         let Some(log) = &self.log else { return };
+        let (server, server_dirty) = sanitize_name(server);
+        let (tool, tool_dirty) = sanitize_name(tool);
         log.write(CallRecord {
             ts: now_rfc3339(),
             id: next_event_id(),
-            server: server.to_string(),
-            tool: tool.to_string(),
+            server,
+            tool,
+            name_sanitized: server_dirty || tool_dirty,
             decision: "rejected".to_string(),
             matched_rule: Some(reason.to_string()),
             is_error: true,
@@ -187,27 +254,25 @@ impl ServerHandler for Gateway {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
+        // Опрашиваем downstream'ы ПАРАЛЛЕЛЬНО и с коротким собственным
+        // таймаутом: последовательный обход с бюджетом вызова означал бы,
+        // что N молчащих серверов держат tools/list N × call_timeout и клиент
+        // отваливается раньше нас (находка верификации M1).
+        let per_server = self.downstreams.iter().map(|(name, ds)| async move {
+            let listed = tokio::time::timeout(self.list_timeout, list_one(name, ds)).await;
+            (name.as_str(), listed)
+        });
         let mut tools = Vec::new();
-        for (name, ds) in &self.downstreams {
-            // Per-server fail-closed: молчащий или упавший downstream теряет
-            // свои tools, остальные работают. Таймаут обязателен — у rmcp
-            // list_tools своего нет, и один зависший сервер иначе подвешивает
-            // выдачу инструментов всего гейтвея. list_all_tools обходит
-            // страницы: без него инструменты за первой страницей исчезают.
-            match tokio::time::timeout(self.call_timeout, ds.list_all_tools()).await {
-                Ok(Ok(listed)) => {
-                    for mut tool in listed {
-                        tool.name = format!("{name}{NS_SEP}{}", tool.name).into();
-                        tools.push(tool);
-                    }
-                }
+        for (name, listed) in futures::future::join_all(per_server).await {
+            match listed {
+                Ok(Ok(listed)) => tools.extend(listed),
                 Ok(Err(e)) => {
                     tracing::warn!(server = %name, error = %e, "tools/list failed; server excluded");
                 }
                 Err(_) => {
                     tracing::warn!(
                         server = %name,
-                        timeout_ms = self.call_timeout.as_millis() as u64,
+                        timeout_ms = self.list_timeout.as_millis() as u64,
                         "tools/list timed out; server excluded from this listing"
                     );
                 }
@@ -222,7 +287,7 @@ impl ServerHandler for Gateway {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
         let full_name = request.name.to_string();
         let Some((server, tool)) = full_name.split_once(NS_SEP) else {
@@ -282,25 +347,73 @@ impl ServerHandler for Gateway {
             }
         }
 
-        // Стадия форварда. Отменяемый запрос с таймаутом: по истечении rmcp
-        // шлёт downstream `notifications/cancelled`. Простой drop future его
-        // не отменяет — downstream молча довёл бы побочный эффект до конца.
+        // Стадия форварда. Ждём ответ сами, чтобы одинаково обработать ОБА
+        // повода перестать ждать: наш таймаут и отмену со стороны клиента
+        // (ESC в клиенте шлёт notifications/cancelled). В обоих случаях
+        // downstream обязан узнать об отмене — простой drop future его не
+        // отменяет, и он молча доводит побочный эффект до конца.
         let mut downstream_req = request;
         downstream_req.name = tool.to_string().into();
         let started = Instant::now();
-        let mut options = PeerRequestOptions::no_options();
-        options.timeout = Some(self.call_timeout);
         let sent = ds
             .send_cancellable_request(
                 ClientRequest::CallToolRequest(CallToolRequest::new(downstream_req)),
-                options,
+                PeerRequestOptions::no_options(),
             )
             .await;
+
+        enum Stop {
+            // Boxed: ServerResult заметно больше остальных вариантов.
+            Answered(Box<Result<ServerResult, ServiceError>>),
+            Timeout,
+            ClientCancelled,
+        }
+
+        let mut abandoned_reason: Option<&'static str> = None;
         let outcome = match sent {
-            Ok(handle) => handle.await_response().await,
             Err(e) => Err(e),
+            Ok(mut handle) => {
+                let stop = tokio::select! {
+                    biased;
+                    _ = context.ct.cancelled() => Stop::ClientCancelled,
+                    _ = tokio::time::sleep(self.call_timeout) => Stop::Timeout,
+                    answered = &mut handle.rx => match answered {
+                        Ok(result) => Stop::Answered(Box::new(result)),
+                        Err(_) => Stop::Answered(Box::new(Err(ServiceError::UnexpectedResponse))),
+                    },
+                };
+                match stop {
+                    Stop::Answered(result) => *result,
+                    Stop::Timeout => {
+                        abandoned_reason = Some("zastava call timeout");
+                        let _ = handle
+                            .cancel(Some("zastava call timeout".to_string()))
+                            .await;
+                        Err(ServiceError::UnexpectedResponse)
+                    }
+                    Stop::ClientCancelled => {
+                        abandoned_reason = Some("client cancelled");
+                        let _ = handle.cancel(Some("client cancelled".to_string())).await;
+                        Err(ServiceError::UnexpectedResponse)
+                    }
+                }
+            }
         };
         let duration_ms = started.elapsed().as_millis() as u64;
+
+        if let Some(reason) = abandoned_reason {
+            self.record(
+                server,
+                tool,
+                &args,
+                decision.as_ref(),
+                CallOutcome::abandoned(duration_ms),
+            );
+            return Ok(Self::tool_error(format!(
+                "stopped waiting for downstream '{server}' after {duration_ms}ms ({reason}); \
+                 cancellation was sent, but the call may still have taken effect"
+            )));
+        }
 
         match outcome {
             Err(ServiceError::Timeout { .. }) => {

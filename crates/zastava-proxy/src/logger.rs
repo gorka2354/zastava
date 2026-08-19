@@ -72,14 +72,20 @@ fn rotate_if_needed(path: &Path, max_bytes: u64) -> std::io::Result<()> {
     }
     let generation = |n: u32| path.with_extension(format!("jsonl.{n}"));
 
-    // Сдвигаем поколения: самое старое уходит, остальные стареют на единицу.
+    // ПОРЯДОК ВАЖЕН: сначала уводим текущий журнал во временное имя и только
+    // при успехе двигаем архив. Иначе устойчиво падающий rename (файл занят
+    // редактором/антивирусом) за ROTATION_KEEP записей стирал ВЕСЬ архив, не
+    // заархивировав ничего (находка верификации M1).
+    let staged = path.with_extension(format!("jsonl.rotating.{}", std::process::id()));
+    if let Err(e) = std::fs::rename(path, &staged) {
+        tracing::warn!(error = %e, "log rotation skipped: current file is busy");
+        return Ok(());
+    }
     let _ = std::fs::remove_file(generation(ROTATION_KEEP));
     for n in (1..ROTATION_KEEP).rev() {
         let _ = std::fs::rename(generation(n), generation(n + 1));
     }
-    // При гонке двух инстансов rename может проиграть — это не фатально:
-    // проигравший просто продолжит писать в свежий файл.
-    match std::fs::rename(path, generation(1)) {
+    match std::fs::rename(&staged, generation(1)) {
         Ok(()) => {
             tracing::info!(to = %generation(1).display(), "log rotated");
             // Разрыв истории обязан быть виден в самом журнале.
@@ -95,7 +101,12 @@ fn rotate_if_needed(path: &Path, max_bytes: u64) -> std::io::Result<()> {
             let mut fresh = OpenOptions::new().create(true).append(true).open(path)?;
             fresh.write_all(format!("{}\n", marker.to_jsonl()).as_bytes())?;
         }
-        Err(e) => tracing::warn!(error = %e, "log rotation failed"),
+        Err(e) => {
+            // Архив уже сдвинут, а staged не встал на место — возвращаем
+            // журнал обратно, чтобы записи не потерялись совсем.
+            tracing::warn!(error = %e, "log rotation failed; restoring current journal");
+            let _ = std::fs::rename(&staged, path);
+        }
     }
     Ok(())
 }
@@ -105,6 +116,28 @@ fn rotate_if_needed(path: &Path, max_bytes: u64) -> std::io::Result<()> {
 pub fn read_records(path: &Path) -> std::io::Result<Vec<CallRecord>> {
     let content = std::fs::read_to_string(path)?;
     Ok(content.lines().filter_map(CallRecord::from_jsonl).collect())
+}
+
+/// Читает журнал ВМЕСТЕ с отротированными поколениями, от старых к новым.
+///
+/// Без этого `ROTATION_KEEP` защищал только файлы на диске: `stats`/`learn`
+/// после первой же ротации показывали историю с нуля (находка верификации M1).
+/// Ошибка чтения текущего файла пробрасывается (её обязан различать вызывающий),
+/// недоступные поколения пропускаются с предупреждением.
+pub fn read_all_generations(path: &Path) -> std::io::Result<Vec<CallRecord>> {
+    let mut records = Vec::new();
+    for n in (1..=ROTATION_KEEP).rev() {
+        let generation = path.with_extension(format!("jsonl.{n}"));
+        match std::fs::read_to_string(&generation) {
+            Ok(content) => records.extend(content.lines().filter_map(CallRecord::from_jsonl)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                tracing::warn!(error = %e, path = %generation.display(), "log generation unreadable")
+            }
+        }
+    }
+    records.extend(read_records(path)?);
+    Ok(records)
 }
 
 #[cfg(test)]
@@ -141,6 +174,44 @@ mod tests {
         let records = read_records(&path).unwrap();
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].id, "a");
+    }
+
+    #[test]
+    fn rotation_keeps_generation_contents_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.jsonl");
+        for tag in ["first", "second"] {
+            std::fs::write(&path, format!("{}\n{}", tag, "x".repeat(100))).unwrap();
+            append_line(&path, 50, &record(tag).to_jsonl()).unwrap();
+        }
+        let gen1 = std::fs::read_to_string(path.with_extension("jsonl.1")).unwrap();
+        let gen2 = std::fs::read_to_string(path.with_extension("jsonl.2")).unwrap();
+        assert!(gen1.contains("second"), "свежее поколение в .1: {gen1}");
+        assert!(gen2.contains("first"), "старое уехало в .2: {gen2}");
+    }
+
+    #[test]
+    fn read_all_generations_returns_history_oldest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.jsonl");
+        std::fs::write(
+            path.with_extension("jsonl.2"),
+            format!("{}\n", record("old").to_jsonl()),
+        )
+        .unwrap();
+        std::fs::write(
+            path.with_extension("jsonl.1"),
+            format!("{}\n", record("mid").to_jsonl()),
+        )
+        .unwrap();
+        std::fs::write(&path, format!("{}\n", record("new").to_jsonl())).unwrap();
+
+        let ids: Vec<String> = read_all_generations(&path)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(ids, vec!["old", "mid", "new"]);
     }
 
     #[test]

@@ -52,6 +52,10 @@ pub struct CallRecord {
     pub result_bytes: u64,
     /// Завершился ли вызов ошибкой (включая таймаут downstream).
     pub is_error: bool,
+    /// Имя сервера/инструмента содержало символы вне whitelist и записано
+    /// экранированным. Факт попытки обязан быть виден при чтении журнала.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub name_sanitized: bool,
     /// Мы перестали ждать ответа (таймаут): downstream получил
     /// `notifications/cancelled`, но МОГ УСПЕТЬ выполнить побочный эффект.
     /// Такая запись не доказывает, что вызов не состоялся.
@@ -77,6 +81,7 @@ impl Default for CallRecord {
             result_bytes: 0,
             is_error: false,
             abandoned: false,
+            name_sanitized: false,
         }
     }
 }
@@ -137,6 +142,7 @@ mod tests {
             result_bytes: 1024,
             is_error: false,
             abandoned: false,
+            name_sanitized: false,
         }
     }
 

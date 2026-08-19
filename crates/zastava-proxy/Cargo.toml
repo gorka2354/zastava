@@ -18,6 +18,7 @@ schemars = "1"
 thiserror.workspace = true
 tracing.workspace = true
 notify.workspace = true
+futures.workspace = true
 
 process-wrap = { version = "9.1", features = ["tokio1", "job-object", "kill-on-drop", "process-session"] }
 

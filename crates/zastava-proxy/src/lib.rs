@@ -42,6 +42,7 @@ pub struct RunOptions {
 pub async fn run(config: Config, options: RunOptions) -> Result<(), ProxyError> {
     let initialize_timeout = Duration::from_millis(config.proxy.initialize_timeout_ms);
     let call_timeout = Duration::from_millis(config.proxy.call_timeout_ms);
+    let list_timeout = Duration::from_millis(config.proxy.list_timeout_ms);
 
     // Eager parallel spawn (T6.4): опоздавшие/упавшие не валят остальных.
     let mut join_set = tokio::task::JoinSet::new();
@@ -108,8 +109,14 @@ pub async fn run(config: Config, options: RunOptions) -> Result<(), ProxyError> 
             }
         });
 
-    let gateway =
-        gateway::Gateway::new(downstreams, policy, log, call_timeout, options.passthrough);
+    let gateway = gateway::Gateway::new(
+        downstreams,
+        policy,
+        log,
+        call_timeout,
+        list_timeout,
+        options.passthrough,
+    );
     let service = gateway
         .serve(rmcp::transport::stdio())
         .await

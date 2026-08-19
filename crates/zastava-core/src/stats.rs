@@ -26,6 +26,11 @@ pub struct StatsSummary {
     pub abandoned: u64,
     /// Маркеров-событий гейтвея (старт, отключение аудита, ротация).
     pub markers: u64,
+    /// Уникальных сигнатур С УЧЁТОМ хэша аргументов. canonical_subset в v0
+    /// всегда пуст, поэтому tool-level счёт схлопывает вызовы с разными
+    /// аргументами и завышает выгоду policy-once — честный M/N лежит в
+    /// диапазоне между двумя цифрами (находка верификации M1).
+    pub unique_sigs_with_args: u64,
 }
 
 impl StatsSummary {
@@ -39,6 +44,7 @@ impl StatsSummary {
 pub fn summarize(records: &[CallRecord]) -> StatsSummary {
     let mut summary = StatsSummary::default();
     let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut seen_with_args: BTreeSet<String> = BTreeSet::new();
 
     for record in records {
         if !record.is_call() {
@@ -60,12 +66,14 @@ pub fn summarize(records: &[CallRecord]) -> StatsSummary {
             "{}\u{1f}{}\u{1f}{:?}\u{1f}{}",
             record.server, record.tool, record.canonical_subset, record.canon_version
         );
+        seen_with_args.insert(format!("{sig_key}\u{1f}{}", record.args_hash));
         if !seen.insert(sig_key) {
             summary.repeats += 1;
         }
     }
 
     summary.unique_sigs = seen.len() as u64;
+    summary.unique_sigs_with_args = seen_with_args.len() as u64;
     summary
 }
 
@@ -101,6 +109,20 @@ mod tests {
         assert_eq!(s.denies, 1);
         assert_eq!(s.errors, 1);
         assert_eq!(s.repeat_ratio(), Some(0.4));
+    }
+
+    #[test]
+    fn args_aware_uniqueness_is_reported_separately() {
+        // Два вызова одного инструмента с РАЗНЫМИ аргументами: tool-level
+        // счёт считает это повтором, args-aware — нет.
+        let mut a = record("s", "t", "allow", false);
+        a.args_hash = "aaa".into();
+        let mut b = record("s", "t", "allow", false);
+        b.args_hash = "bbb".into();
+        let s = summarize(&[a, b]);
+        assert_eq!(s.unique_sigs, 1);
+        assert_eq!(s.unique_sigs_with_args, 2);
+        assert_eq!(s.repeats, 1, "tool-level повтор остаётся повтором");
     }
 
     #[test]

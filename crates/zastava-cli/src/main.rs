@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
 use clap::{Parser, Subcommand};
-use zastava_core::config::{parse_sig, ServerConfig};
+use zastava_core::config::{is_safe_sig, parse_sig, ServerConfig};
 use zastava_core::Config;
 
 /// Обёртка для сериализации импортированных серверов в TOML.
@@ -44,8 +44,10 @@ enum Command {
     Check,
     /// Запустить гейтвей (stdio MCP-сервер) до EOF клиента.
     Run {
-        /// Прозрачный режим без политик и журнала — путь отступления.
-        /// Также включается переменной окружения ZASTAVA_DISABLE=1.
+        /// Прозрачный режим: политика не применяется. Журнал ПРОДОЛЖАЕТ
+        /// вестись и помечается маркером policy_disabled — отключение
+        /// контроля обязано оставлять след. Также включается переменной
+        /// окружения ZASTAVA_DISABLE=1.
         #[arg(long)]
         passthrough: bool,
     },
@@ -185,7 +187,9 @@ fn run(path: &Path, passthrough_flag: bool) -> anyhow::Result<()> {
 /// файла и пустая история обязаны выглядеть по-разному, а ошибка чтения не
 /// должна маскироваться под «вызовов не было» (находка ревью M1).
 fn read_journal(log_path: &Path) -> anyhow::Result<Option<Vec<zastava_core::CallRecord>>> {
-    match zastava_proxy::logger::read_records(log_path) {
+    // Читаем вместе с отротированными поколениями: иначе после первой же
+    // ротации история для пользователя начиналась с нуля.
+    match zastava_proxy::logger::read_all_generations(log_path) {
         Ok(records) => Ok(Some(records)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e).with_context(|| format!("cannot read journal: {}", log_path.display())),
@@ -247,6 +251,13 @@ fn allow(path: &Path, sig: &str) -> anyhow::Result<()> {
     let parsed = parse_sig(sig).with_context(|| {
         format!("malformed sig '{sig}': expected <server>__<tool> or <server>__*")
     })?;
+    // Строгий charset — именно на пути ЗАПИСИ: сигнатура уходит в TOML-файл,
+    // и кавычка с переводом строки там означала бы дописанные правила
+    // (воспроизведено на ревью M1). Разбор существующего конфига при этом
+    // остаётся терпимым, иначе гейтвей не стартовал бы на чужих именах.
+    if !is_safe_sig(sig) {
+        bail!("unsafe characters in sig '{sig}': allowed set is [A-Za-z0-9_.-] plus '__' and '*'");
+    }
     if !config.servers.contains_key(parsed.server) {
         bail!(
             "unknown server '{}' (known: {})",
@@ -287,6 +298,14 @@ fn learn(path: &Path) -> anyhow::Result<()> {
     };
     let output = zastava_core::learn::suggest(&records, &config);
 
+    if !output.suspicious.is_empty() {
+        println!("# ⛔ Имена с недопустимыми символами — в правила НЕ предлагаются");
+        println!("#    (имя инструмента выбирает downstream; показано экранированным):");
+        for sig in &output.suspicious {
+            println!("#   {sig}");
+        }
+        println!();
+    }
     if !output.narrowed.is_empty() {
         println!("# ⚠ Уже под аргументным правилом — расширять только осознанно:");
         for sig in &output.narrowed {
@@ -433,7 +452,7 @@ fn write_private(path: &Path, content: &str) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
         use std::io::Write as _;
-        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
@@ -441,6 +460,10 @@ fn write_private(path: &Path, content: &str) -> anyhow::Result<()> {
             .mode(0o600)
             .open(path)?;
         file.write_all(content.as_bytes())?;
+        // mode() действует только при СОЗДАНИИ: у существующего файла
+        // (import --force поверх старого) права надо выставить явно, иначе
+        // токены из env остаются читаемыми всем (находка верификации M1).
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
         return Ok(());
     }
     #[cfg(not(unix))]
