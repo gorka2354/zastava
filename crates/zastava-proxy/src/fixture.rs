@@ -150,6 +150,95 @@ impl rmcp::ServerHandler for EndlessPagingFixture {
     }
 }
 
+/// Фикстура с ресурсом и промптом: настоящие MCP-серверы отдают не только
+/// инструменты, и M2-lite обязан их проксировать.
+#[derive(Clone)]
+pub struct RichFixture;
+
+impl rmcp::ServerHandler for RichFixture {
+    fn get_info(&self) -> rmcp::model::ServerInfo {
+        let mut info = rmcp::model::ServerInfo::default();
+        info.capabilities = rmcp::model::ServerCapabilities::builder()
+            .enable_tools()
+            .enable_resources()
+            .enable_prompts()
+            .build();
+        info
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> Result<rmcp::model::ListToolsResult, rmcp::model::ErrorData> {
+        Ok(
+            rmcp::model::ListToolsResult::with_all_items(vec![stub_tool("noop")])
+                .with_ttl_ms(0)
+                .with_cache_scope(rmcp::model::CacheScope::Private),
+        )
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> Result<rmcp::model::ListResourcesResult, rmcp::model::ErrorData> {
+        let resource = rmcp::model::Resource::new("mem://note", "note");
+        Ok(
+            rmcp::model::ListResourcesResult::with_all_items(vec![resource])
+                .with_ttl_ms(0)
+                .with_cache_scope(rmcp::model::CacheScope::Private),
+        )
+    }
+
+    async fn read_resource(
+        &self,
+        request: rmcp::model::ReadResourceRequestParams,
+        _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> Result<rmcp::model::ReadResourceResponse, rmcp::model::ErrorData> {
+        if request.uri != "mem://note" {
+            return Err(rmcp::model::ErrorData::invalid_params("unknown uri", None));
+        }
+        let contents = rmcp::model::ResourceContents::text("resource payload", "mem://note");
+        let mut result = rmcp::model::ReadResourceResult::new(vec![contents]);
+        // Имитируем downstream старой ревизии протокола: гейтвей обязан
+        // восстановить resultType, иначе современный клиент отвергнет ответ.
+        result.result_type = None;
+        Ok(rmcp::model::ReadResourceResponse::Complete(result))
+    }
+
+    async fn list_prompts(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> Result<rmcp::model::ListPromptsResult, rmcp::model::ErrorData> {
+        let prompt = rmcp::model::Prompt::new("greet", Some("greeting prompt"), None);
+        Ok(rmcp::model::ListPromptsResult::with_all_items(vec![prompt])
+            .with_ttl_ms(0)
+            .with_cache_scope(rmcp::model::CacheScope::Private))
+    }
+
+    async fn get_prompt(
+        &self,
+        request: rmcp::model::GetPromptRequestParams,
+        _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> Result<rmcp::model::GetPromptResponse, rmcp::model::ErrorData> {
+        if request.name != "greet" {
+            return Err(rmcp::model::ErrorData::invalid_params(
+                "unknown prompt",
+                None,
+            ));
+        }
+        let mut result =
+            rmcp::model::GetPromptResult::new(vec![rmcp::model::PromptMessage::new_text(
+                rmcp::model::Role::User,
+                "hello from fixture",
+            )]);
+        result.result_type = None;
+        Ok(rmcp::model::GetPromptResponse::Complete(result))
+    }
+}
+
 /// Точка входа бинаря фикстуры: stdio-сервер до EOF клиента.
 pub async fn run_echo_fixture_stdio() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let name = std::env::var("ECHO_FIXTURE_NAME").unwrap_or_else(|_| "echo".to_string());

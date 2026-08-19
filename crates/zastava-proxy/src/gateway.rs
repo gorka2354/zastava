@@ -23,7 +23,9 @@ use std::time::{Duration, Instant};
 
 use rmcp::model::{
     CallToolRequest, CallToolRequestParams, CallToolResponse, CallToolResult, ClientRequest,
-    ContentBlock, ErrorData, Implementation, ListToolsResult, PaginatedRequestParams, ResultType,
+    ContentBlock, ErrorData, GetPromptRequestParams, GetPromptResponse, Implementation,
+    ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult, ListToolsResult,
+    PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResponse, Resource, ResultType,
     ServerCapabilities, ServerInfo, ServerResult, Tool,
 };
 use rmcp::service::{
@@ -133,6 +135,14 @@ pub struct Gateway {
     call_timeout: Duration,
     list_timeout: Duration,
     passthrough: bool,
+    log_args: bool,
+    /// Возможности, вычисленные из реальных downstream'ов: объявлять
+    /// resources/prompts, которых ни у кого нет, — врать клиенту.
+    capabilities: ServerCapabilities,
+    /// URI ресурса → downstream-владелец. Ресурсы адресуются URI, а не
+    /// именем, поэтому префиксовать их нельзя (сломается адресация) —
+    /// маршрутизируем по карте владения, которую обновляем на листинге.
+    resource_owners: Arc<RwLock<HashMap<String, String>>>,
 }
 
 /// Потолки обхода пагинации downstream'а. Без них downstream, повторяющий
@@ -140,6 +150,13 @@ pub struct Gateway {
 /// таймаут ограничивает время, но не память (находка верификации M1: ~1.8 млн
 /// Tool-структур за секунду → OOM гейтвея).
 const MAX_LIST_PAGES: usize = 50;
+/// Псевдо-имена в журнале для не-инструментальных действий: чтение ресурса и
+/// получение промпта — тоже действия агента и обязаны быть в аудите.
+/// Символы взяты из того же whitelist, что и обычные имена: иначе наши
+/// собственные метки экранировались бы санитайзером и записи ложно
+/// помечались как name_sanitized.
+const RESOURCE_PSEUDO_TOOL: &str = "zastava.resource";
+const PROMPT_PSEUDO_TOOL: &str = "zastava.prompt.";
 const MAX_TOOLS_PER_SERVER: usize = 2_000;
 
 impl Gateway {
@@ -153,6 +170,29 @@ impl Gateway {
         list_timeout: Duration,
         passthrough: bool,
     ) -> Self {
+        Self::with_options(
+            downstreams,
+            policy,
+            log,
+            call_timeout,
+            list_timeout,
+            passthrough,
+            false,
+        )
+    }
+
+    /// Полный конструктор: дополнительно принимает `log_args` (писать ли в
+    /// журнал полные аргументы вызовов).
+    pub fn with_options(
+        downstreams: HashMap<String, DownstreamService>,
+        policy: Arc<RwLock<PolicyEngine>>,
+        log: Option<LogHandle>,
+        call_timeout: Duration,
+        list_timeout: Duration,
+        passthrough: bool,
+        log_args: bool,
+    ) -> Self {
+        let capabilities = merged_capabilities(&downstreams);
         Self {
             downstreams,
             policy,
@@ -160,7 +200,73 @@ impl Gateway {
             call_timeout,
             list_timeout,
             passthrough,
+            log_args,
+            capabilities,
+            resource_owners: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Обновляет карту «URI ресурса → сервер», опрашивая downstream'ы.
+    async fn refresh_resource_owners(&self) -> Vec<Resource> {
+        let per_server = self.downstreams.iter().map(|(name, ds)| async move {
+            let listed = tokio::time::timeout(self.list_timeout, ds.list_all_resources()).await;
+            (name.clone(), listed)
+        });
+        let mut resources = Vec::new();
+        let mut owners = HashMap::new();
+        for (name, listed) in futures::future::join_all(per_server).await {
+            match listed {
+                Ok(Ok(listed)) => {
+                    for resource in listed {
+                        // Первый объявивший URI им и владеет: одинаковые URI
+                        // у разных серверов — конфликт, о котором сообщаем.
+                        match owners.entry(resource.uri.clone()) {
+                            std::collections::hash_map::Entry::Vacant(slot) => {
+                                slot.insert(name.clone());
+                                resources.push(resource);
+                            }
+                            std::collections::hash_map::Entry::Occupied(taken) => {
+                                tracing::warn!(
+                                    uri = %resource.uri,
+                                    owner = %taken.get(),
+                                    duplicate = %name,
+                                    "resource URI claimed by two servers; keeping the first"
+                                );
+                            }
+                        }
+                    }
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(server = %name, error = %e, "resources/list failed; server excluded")
+                }
+                Err(_) => {
+                    tracing::warn!(server = %name, "resources/list timed out; server excluded")
+                }
+            }
+        }
+        *self.resource_owners.write().expect("owners lock poisoned") = owners;
+        resources
+    }
+
+    /// Кто отдаёт этот URI. При промахе — один рефреш карты (ресурс мог
+    /// появиться после последнего листинга), потом отказ.
+    async fn owner_of(&self, uri: &str) -> Option<String> {
+        if let Some(owner) = self
+            .resource_owners
+            .read()
+            .expect("owners lock poisoned")
+            .get(uri)
+        {
+            return Some(owner.clone());
+        }
+        self.refresh_resource_owners().await;
+        let owner = self
+            .resource_owners
+            .read()
+            .expect("owners lock poisoned")
+            .get(uri)
+            .cloned();
+        owner
     }
 
     fn record(
@@ -186,7 +292,11 @@ impl Gateway {
                 d.enforced,
                 d.matched_rule.clone(),
             ),
-            None => ("passthrough", false, None),
+            // Различаем «контроль выключен» и «этот тип действия политика
+            // v0.1 не покрывает» (ресурсы и промпты): в журнале это разные
+            // факты, и путать их нельзя.
+            None if self.passthrough => ("passthrough", false, None),
+            None => ("ungated", false, None),
         };
         log.write(CallRecord {
             ts: now_rfc3339(),
@@ -197,6 +307,9 @@ impl Gateway {
             name_sanitized: server_dirty || tool_dirty,
             canon_version: CANON_VERSION,
             args_hash: full_args_hash(args),
+            // Полные аргументы — только по явному опт-ину: до маскировки
+            // секретов (M4) сюда попадёт всё, включая токены.
+            args: self.log_args.then(|| Value::Object(args.clone())),
             decision: decision_str.to_string(),
             enforced,
             matched_rule,
@@ -233,10 +346,32 @@ impl Gateway {
     }
 }
 
+/// Объявляем только те возможности, которые реально есть хотя бы у одного
+/// downstream: обещать клиенту resources/prompts, которых никто не отдаёт, —
+/// врать (клиент будет слать запросы, на которые придёт пустота).
+fn merged_capabilities(downstreams: &HashMap<String, DownstreamService>) -> ServerCapabilities {
+    let mut capabilities = ServerCapabilities::builder()
+        .enable_tools()
+        .enable_prompts()
+        .enable_resources()
+        .build();
+    let peers: Vec<_> = downstreams
+        .values()
+        .filter_map(|ds| ds.peer_info())
+        .collect();
+    if !peers.iter().any(|p| p.capabilities.resources.is_some()) {
+        capabilities.resources = None;
+    }
+    if !peers.iter().any(|p| p.capabilities.prompts.is_some()) {
+        capabilities.prompts = None;
+    }
+    capabilities
+}
+
 impl ServerHandler for Gateway {
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::default();
-        info.capabilities = ServerCapabilities::builder().enable_tools().build();
+        info.capabilities = self.capabilities.clone();
         // Иначе клиент видит нас как "rmcp" и так же пишет в свои логи.
         info.server_info = Implementation::new("zastava", env!("CARGO_PKG_VERSION"))
             .with_title("Zastava MCP gateway");
@@ -492,6 +627,233 @@ impl ServerHandler for Gateway {
                     },
                 );
                 Ok(response)
+            }
+        }
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, ErrorData> {
+        // URI не префиксуем: он адрес, а не имя. Маршрутизация — по карте
+        // владения, которую этот же вызов и обновляет.
+        let resources = self.refresh_resource_owners().await;
+        Ok(ListResourcesResult::with_all_items(resources)
+            .with_ttl_ms(0)
+            .with_cache_scope(rmcp::model::CacheScope::Private))
+    }
+
+    async fn list_resource_templates(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourceTemplatesResult, ErrorData> {
+        let per_server = self.downstreams.iter().map(|(name, ds)| async move {
+            let listed =
+                tokio::time::timeout(self.list_timeout, ds.list_all_resource_templates()).await;
+            (name.as_str(), listed)
+        });
+        let mut templates = Vec::new();
+        for (name, listed) in futures::future::join_all(per_server).await {
+            match listed {
+                Ok(Ok(listed)) => templates.extend(listed),
+                Ok(Err(e)) => {
+                    tracing::warn!(server = %name, error = %e, "resources/templates/list failed")
+                }
+                Err(_) => tracing::warn!(server = %name, "resources/templates/list timed out"),
+            }
+        }
+        Ok(ListResourceTemplatesResult::with_all_items(templates)
+            .with_ttl_ms(0)
+            .with_cache_scope(rmcp::model::CacheScope::Private))
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResponse, ErrorData> {
+        let uri = request.uri.clone();
+        let Some(owner) = self.owner_of(&uri).await else {
+            self.record_rejected("?", &uri, "resource URI owned by no downstream");
+            return Err(ErrorData::invalid_params(
+                format!("unknown resource: {uri}"),
+                None,
+            ));
+        };
+        let Some(ds) = self.downstreams.get(&owner) else {
+            return Err(ErrorData::internal_error(
+                format!("downstream '{owner}' is gone"),
+                None,
+            ));
+        };
+
+        // Чтение ресурса — тоже действие агента, и оно обязано попасть в
+        // аудит. Политика v0.1 покрывает только инструменты (см. design-док),
+        // поэтому здесь фиксируем факт, а не решение.
+        let started = Instant::now();
+        let outcome = tokio::time::timeout(self.call_timeout, ds.read_resource(request)).await;
+        let duration_ms = started.elapsed().as_millis() as u64;
+        let mut args = Map::new();
+        args.insert("uri".to_string(), Value::String(uri.clone()));
+
+        match outcome {
+            Ok(Ok(mut result)) => {
+                // Тот же урок спайка, что и для tools/call: downstream мог
+                // договориться о старой ревизии, и rmcp вычистил resultType —
+                // клиент на 2026-07-28 отвергает такой ответ. Поймано живым
+                // клиентом на реальном сервере, тесты с фикстурами молчали.
+                result.result_type = Some(ResultType::COMPLETE);
+                let result_bytes = serde_json::to_string(&result)
+                    .map(|s| s.len() as u64)
+                    .unwrap_or(0);
+                self.record(
+                    &owner,
+                    RESOURCE_PSEUDO_TOOL,
+                    &args,
+                    None,
+                    CallOutcome {
+                        duration_ms,
+                        result_bytes,
+                        is_error: false,
+                        abandoned: false,
+                    },
+                );
+                Ok(ReadResourceResponse::Complete(result))
+            }
+            Ok(Err(e)) => {
+                self.record(
+                    &owner,
+                    RESOURCE_PSEUDO_TOOL,
+                    &args,
+                    None,
+                    CallOutcome::failed(duration_ms),
+                );
+                Err(ErrorData::internal_error(
+                    format!("downstream '{owner}' failed to read {uri}: {e}"),
+                    None,
+                ))
+            }
+            Err(_) => {
+                self.record(
+                    &owner,
+                    RESOURCE_PSEUDO_TOOL,
+                    &args,
+                    None,
+                    CallOutcome::abandoned(duration_ms),
+                );
+                Err(ErrorData::internal_error(
+                    format!("downstream '{owner}' timed out reading {uri}"),
+                    None,
+                ))
+            }
+        }
+    }
+
+    async fn list_prompts(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListPromptsResult, ErrorData> {
+        // Промпты адресуются ИМЕНЕМ — префиксуем так же, как инструменты.
+        let per_server = self.downstreams.iter().map(|(name, ds)| async move {
+            let listed = tokio::time::timeout(self.list_timeout, ds.list_all_prompts()).await;
+            (name.as_str(), listed)
+        });
+        let mut prompts = Vec::new();
+        for (name, listed) in futures::future::join_all(per_server).await {
+            match listed {
+                Ok(Ok(listed)) => {
+                    for mut prompt in listed {
+                        prompt.name = format!("{name}{NS_SEP}{}", prompt.name);
+                        prompts.push(prompt);
+                    }
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(server = %name, error = %e, "prompts/list failed; server excluded")
+                }
+                Err(_) => tracing::warn!(server = %name, "prompts/list timed out; server excluded"),
+            }
+        }
+        Ok(ListPromptsResult::with_all_items(prompts)
+            .with_ttl_ms(0)
+            .with_cache_scope(rmcp::model::CacheScope::Private))
+    }
+
+    async fn get_prompt(
+        &self,
+        request: GetPromptRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<GetPromptResponse, ErrorData> {
+        let full_name = request.name.clone();
+        let Some((server, prompt)) = full_name.split_once(NS_SEP) else {
+            self.record_rejected(&full_name, "", "prompt name without namespace");
+            return Err(ErrorData::invalid_params(
+                format!("prompt without namespace: {full_name}"),
+                None,
+            ));
+        };
+        let Some(ds) = self.downstreams.get(server) else {
+            self.record_rejected(server, prompt, "unknown downstream server");
+            return Err(ErrorData::invalid_params(
+                format!("unknown downstream: {server}"),
+                None,
+            ));
+        };
+        let mut downstream_req = request;
+        downstream_req.name = prompt.to_string();
+
+        let started = Instant::now();
+        let outcome = tokio::time::timeout(self.call_timeout, ds.get_prompt(downstream_req)).await;
+        let duration_ms = started.elapsed().as_millis() as u64;
+        let args = Map::new();
+
+        match outcome {
+            Ok(Ok(mut result)) => {
+                result.result_type = Some(ResultType::COMPLETE);
+                let result_bytes = serde_json::to_string(&result)
+                    .map(|s| s.len() as u64)
+                    .unwrap_or(0);
+                self.record(
+                    server,
+                    &format!("{PROMPT_PSEUDO_TOOL}{prompt}"),
+                    &args,
+                    None,
+                    CallOutcome {
+                        duration_ms,
+                        result_bytes,
+                        is_error: false,
+                        abandoned: false,
+                    },
+                );
+                Ok(GetPromptResponse::Complete(result))
+            }
+            Ok(Err(e)) => {
+                self.record(
+                    server,
+                    &format!("{PROMPT_PSEUDO_TOOL}{prompt}"),
+                    &args,
+                    None,
+                    CallOutcome::failed(duration_ms),
+                );
+                Err(ErrorData::internal_error(
+                    format!("downstream '{server}' failed to get prompt: {e}"),
+                    None,
+                ))
+            }
+            Err(_) => {
+                self.record(
+                    server,
+                    &format!("{PROMPT_PSEUDO_TOOL}{prompt}"),
+                    &args,
+                    None,
+                    CallOutcome::abandoned(duration_ms),
+                );
+                Err(ErrorData::internal_error(
+                    format!("downstream '{server}' timed out getting prompt"),
+                    None,
+                ))
             }
         }
     }

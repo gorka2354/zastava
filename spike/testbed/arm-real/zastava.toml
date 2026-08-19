@@ -1,0 +1,10 @@
+[servers.everything]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-everything"]
+
+[servers.memory]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-memory"]
+
+[log]
+path = "C:/path/to/zastava/spike/testbed/arm-real/calls.jsonl"

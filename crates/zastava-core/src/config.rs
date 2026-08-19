@@ -199,6 +199,16 @@ impl Config {
                     "server name '{name}' must not contain '{NS_SEP}' (namespace separator)"
                 ));
             }
+            // Хвостовой '_' делает неймспейс неоднозначным: сервер `alpha_`
+            // с инструментом `ping` и сервер `alpha` с инструментом `_ping`
+            // дают одно внешнее имя `alpha___ping`, а разбор по ПЕРВОМУ `__`
+            // всегда выбирает короткий вариант — первый сервер стал бы
+            // недоступен целиком (находка верификации M1).
+            if name.ends_with('_') {
+                problems.push(format!(
+                    "server name '{name}' must not end with '_': it makes '{NS_SEP}' ambiguous"
+                ));
+            }
             if server.command.trim().is_empty() {
                 problems.push(format!("server '{name}': command is empty"));
             }
@@ -392,6 +402,12 @@ log_args = false
     fn empty_servers_is_invalid() {
         let err = Config::from_toml_str("[policy]\nmode = \"warn\"\n").unwrap_err();
         assert_invalid_contains(&err, "no servers configured");
+    }
+
+    #[test]
+    fn server_name_with_trailing_underscore_is_invalid() {
+        let err = Config::from_toml_str("[servers.alpha_]\ncommand = \"x\"\n").unwrap_err();
+        assert_invalid_contains(&err, "must not end with");
     }
 
     #[test]

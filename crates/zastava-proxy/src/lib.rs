@@ -109,13 +109,14 @@ pub async fn run(config: Config, options: RunOptions) -> Result<(), ProxyError> 
             }
         });
 
-    let gateway = gateway::Gateway::new(
+    let gateway = gateway::Gateway::with_options(
         downstreams,
         policy,
         log,
         call_timeout,
         list_timeout,
         options.passthrough,
+        config.log.log_args,
     );
     let service = gateway
         .serve(rmcp::transport::stdio())

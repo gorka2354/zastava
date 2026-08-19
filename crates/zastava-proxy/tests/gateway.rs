@@ -9,7 +9,7 @@ use std::time::Duration;
 use rmcp::model::{CallToolRequestParams, CallToolResult, ContentBlock};
 use rmcp::ServiceExt;
 use zastava_core::{Config, PolicyEngine};
-use zastava_proxy::fixture::{EchoFixture, EndlessPagingFixture, HangingFixture};
+use zastava_proxy::fixture::{EchoFixture, EndlessPagingFixture, HangingFixture, RichFixture};
 use zastava_proxy::gateway::{DownstreamService, Gateway};
 use zastava_proxy::logger;
 
@@ -283,7 +283,144 @@ async fn gateway_over(
     ().serve(client_io).await.unwrap()
 }
 
-/// Инструменты за первой страницей раньше исчезали молча (P1 ревью M1).
+/// Клиент, договаривающийся о ревизии 2026-07-28. Дефолтный клиент rmcp
+/// объявляет 2025-11-25, и rmcp сам вычищает `resultType` для таких пиров —
+/// то есть на дефолтном клиенте баг «forwarded result без resultType»
+/// невоспроизводим. Живой Claude Code договаривается именно о 2026-07-28.
+#[derive(Clone)]
+struct ModernClient;
+
+impl rmcp::ClientHandler for ModernClient {
+    fn get_info(&self) -> rmcp::model::ClientInfo {
+        let mut info = rmcp::model::ClientInfo::default();
+        info.protocol_version = rmcp::model::ProtocolVersion::V_2026_07_28;
+        info
+    }
+}
+
+/// M2-lite: настоящие MCP-серверы отдают не только инструменты. Ресурс
+/// маршрутизируется по URI (префиксовать URI нельзя — он адрес), промпт — по
+/// префиксу имени, как инструмент.
+#[tokio::test]
+async fn resources_and_prompts_are_proxied() {
+    let mut downstreams = HashMap::new();
+    downstreams.insert("rich".to_string(), serve_fixture(RichFixture).await);
+    let config = Config::from_toml_str(WARN_NO_RULES).unwrap();
+    let gateway = Gateway::new(
+        downstreams,
+        Arc::new(RwLock::new(PolicyEngine::from_config(&config.policy))),
+        None,
+        Duration::from_millis(5_000),
+        Duration::from_millis(2_000),
+        false,
+    );
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        if let Ok(running) = gateway.serve(server_io).await {
+            let _ = running.waiting().await;
+        }
+    });
+    let client = ModernClient.serve(client_io).await.unwrap();
+
+    // Возможности вычисляются из downstream'ов, а не объявляются вслепую.
+    let info = client.peer_info().expect("server info");
+    assert!(info.capabilities.resources.is_some(), "ресурсы объявлены");
+    assert!(info.capabilities.prompts.is_some(), "промпты объявлены");
+
+    let resources = client.list_resources(Default::default()).await.unwrap();
+    let uris: Vec<String> = resources.resources.iter().map(|r| r.uri.clone()).collect();
+    assert_eq!(uris, vec!["mem://note"], "URI остаётся немодифицированным");
+
+    let read = client
+        .read_resource(rmcp::model::ReadResourceRequestParams::new("mem://note"))
+        .await
+        .expect("resource read");
+    let payload = format!("{read:?}");
+    assert!(payload.contains("resource payload"), "{payload}");
+    // Урок спайка распространяется и на ресурсы: downstream старой ревизии
+    // отдаёт результат без resultType, клиент 2026-07-28 такой отвергает.
+    assert!(
+        read.result_type.is_some(),
+        "гейтвей обязан восстановить resultType"
+    );
+
+    let prompts = client.list_prompts(Default::default()).await.unwrap();
+    let names: Vec<String> = prompts.prompts.iter().map(|p| p.name.clone()).collect();
+    assert_eq!(names, vec!["rich__greet"], "имя промпта префиксуется");
+
+    let got = client
+        .get_prompt(rmcp::model::GetPromptRequestParams::new("rich__greet"))
+        .await
+        .expect("prompt get");
+    assert!(format!("{got:?}").contains("hello from fixture"));
+    assert!(
+        got.result_type.is_some(),
+        "resultType обязан быть восстановлен и для промптов"
+    );
+}
+
+/// Ресурсы и промпты — тоже действия агента и обязаны попадать в аудит.
+#[tokio::test]
+async fn resource_and_prompt_access_is_audited() {
+    let log_dir = tempfile::tempdir().unwrap();
+    let log_path = log_dir.path().join("calls.jsonl");
+    let log = logger::start(log_path.clone(), logger::DEFAULT_MAX_LOG_BYTES);
+
+    let mut downstreams = HashMap::new();
+    downstreams.insert("rich".to_string(), serve_fixture(RichFixture).await);
+    let config = Config::from_toml_str(WARN_NO_RULES).unwrap();
+    let gateway = Gateway::new(
+        downstreams,
+        Arc::new(RwLock::new(PolicyEngine::from_config(&config.policy))),
+        Some(log),
+        Duration::from_millis(5_000),
+        Duration::from_millis(2_000),
+        false,
+    );
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        if let Ok(running) = gateway.serve(server_io).await {
+            let _ = running.waiting().await;
+        }
+    });
+    let client = ().serve(client_io).await.unwrap();
+
+    let _ = client.list_resources(Default::default()).await.unwrap();
+    let _ = client
+        .read_resource(rmcp::model::ReadResourceRequestParams::new("mem://note"))
+        .await
+        .unwrap();
+    let _ = client
+        .get_prompt(rmcp::model::GetPromptRequestParams::new("rich__greet"))
+        .await
+        .unwrap();
+
+    let records = wait_records(&log_path, 2).await;
+    let tools: Vec<String> = records.iter().map(|r| r.tool.clone()).collect();
+    assert!(
+        tools.iter().any(|t| t == "zastava.resource"),
+        "чтение ресурса в журнале: {tools:?}"
+    );
+    assert!(
+        tools.iter().any(|t| t.starts_with("zastava.prompt.")),
+        "получение промпта в журнале: {tools:?}"
+    );
+}
+
+/// Сервер без ресурсов не должен заставлять гейтвей обещать их клиенту.
+#[tokio::test]
+async fn capabilities_reflect_actual_downstreams() {
+    let mut downstreams = HashMap::new();
+    downstreams.insert("alpha".to_string(), fixture_downstream("alpha").await);
+    let client = gateway_over(downstreams, 2_000).await;
+    let info = client.peer_info().expect("server info");
+    assert!(info.capabilities.tools.is_some());
+    assert!(
+        info.capabilities.resources.is_none(),
+        "ресурсов ни у кого нет — обещать их нельзя"
+    );
+}
+
 #[tokio::test]
 async fn paginated_downstream_yields_all_pages() {
     let mut downstreams = HashMap::new();
