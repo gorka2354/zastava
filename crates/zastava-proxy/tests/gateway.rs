@@ -9,7 +9,7 @@ use std::time::Duration;
 use rmcp::model::{CallToolRequestParams, CallToolResult, ContentBlock};
 use rmcp::ServiceExt;
 use zastava_core::{Config, PolicyEngine};
-use zastava_proxy::downstream::{DownstreamHandler, UpstreamSlot};
+use zastava_proxy::downstream::{DownstreamHandler, Shared};
 use zastava_proxy::fixture::{
     EchoFixture, EndlessPagingFixture, HangingFixture, ProgressFixture, RichFixture,
 };
@@ -27,7 +27,7 @@ async fn fixture_downstream(name: &str) -> DownstreamService {
     });
     // Клиент-роль теперь настоящий обработчик, а не юнит-тип: тесты
     // обязаны ходить тем же путём, что и боевой код.
-    DownstreamHandler::new("test", UpstreamSlot::new())
+    DownstreamHandler::new("test", Shared::default())
         .serve(client_io)
         .await
         .expect("fixture client")
@@ -305,7 +305,7 @@ where
     });
     // Клиент-роль теперь настоящий обработчик, а не юнит-тип: тесты
     // обязаны ходить тем же путём, что и боевой код.
-    DownstreamHandler::new("test", UpstreamSlot::new())
+    DownstreamHandler::new("test", Shared::default())
         .serve(client_io)
         .await
         .expect("fixture client")
@@ -525,7 +525,7 @@ async fn hung_downstream_does_not_block_tool_listing_of_others() {
             let _ = running.waiting().await;
         }
     });
-    let hung = DownstreamHandler::new("hung", UpstreamSlot::new())
+    let hung = DownstreamHandler::new("hung", Shared::default())
         .serve(client_io)
         .await
         .expect("hung client");
@@ -980,10 +980,16 @@ async fn progress_from_downstream_reaches_the_client_with_its_own_token() {
             let _ = running.waiting().await;
         }
     });
-    let ds = DownstreamHandler::with_progress("prog", UpstreamSlot::new(), bridge.clone())
-        .serve(fixture_io)
-        .await
-        .expect("downstream client");
+    let ds = DownstreamHandler::new(
+        "prog",
+        Shared {
+            progress: bridge.clone(),
+            ..Shared::default()
+        },
+    )
+    .serve(fixture_io)
+    .await
+    .expect("downstream client");
 
     let mut downstreams = HashMap::new();
     downstreams.insert("prog".to_string(), ds);
@@ -1110,10 +1116,16 @@ async fn progress_of_one_server_never_lands_in_a_call_to_another() {
                 let _ = running.waiting().await;
             }
         });
-        let ds = DownstreamHandler::with_progress(name, UpstreamSlot::new(), bridge.clone())
-            .serve(client_io)
-            .await
-            .expect("downstream client");
+        let ds = DownstreamHandler::new(
+            name,
+            Shared {
+                progress: bridge.clone(),
+                ..Shared::default()
+            },
+        )
+        .serve(client_io)
+        .await
+        .expect("downstream client");
         downstreams.insert(name.to_string(), ds);
     }
 

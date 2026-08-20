@@ -50,6 +50,8 @@ struct CallOutcome {
     is_error: bool,
     /// Мы перестали ждать ответа: побочный эффект мог состояться.
     abandoned: bool,
+    /// Почему всё закончилось именно так.
+    reason: Option<String>,
 }
 
 impl CallOutcome {
@@ -59,6 +61,7 @@ impl CallOutcome {
             result_bytes: 0,
             is_error: false,
             abandoned: false,
+            reason: None,
         }
     }
     fn failed(duration_ms: u64) -> Self {
@@ -67,6 +70,7 @@ impl CallOutcome {
             result_bytes: 0,
             is_error: true,
             abandoned: false,
+            reason: None,
         }
     }
     fn abandoned(duration_ms: u64) -> Self {
@@ -75,7 +79,15 @@ impl CallOutcome {
             result_bytes: 0,
             is_error: true,
             abandoned: true,
+            reason: None,
         }
+    }
+
+    /// Дополняет исход причиной: «таймаут» и «downstream умер» — разные
+    /// факты, и различать их обязан журнал, а не только текст для модели.
+    fn because(mut self, reason: impl Into<String>) -> Self {
+        self.reason = Some(reason.into());
+        self
     }
 }
 
@@ -351,6 +363,7 @@ impl Gateway {
             result_bytes: outcome.result_bytes,
             is_error: outcome.is_error,
             abandoned: outcome.abandoned,
+            reason: outcome.reason,
             ..Default::default()
         });
     }
@@ -372,6 +385,20 @@ impl Gateway {
             is_error: true,
             ..Default::default()
         });
+    }
+
+    /// Пишет в аудит, что сервер выпал из выдачи.
+    fn mark_unreachable(&self, server: &str, detail: &str) {
+        let Some(log) = &self.log else { return };
+        let (server, dirty) = sanitize_name(server);
+        let mut record = CallRecord::marker(
+            now_rfc3339(),
+            next_event_id(),
+            "downstream_unreachable",
+            Some(format!("{server}: {detail}")),
+        );
+        record.name_sanitized = dirty;
+        log.write(record);
     }
 
     fn tool_error(message: String) -> CallToolResponse {
@@ -491,14 +518,26 @@ impl ServerHandler for Gateway {
         for (name, listed) in futures::future::join_all(per_server).await {
             match listed {
                 Ok(Ok(listed)) => tools.extend(listed),
+                // Сервер выпал из выдачи — его инструменты просто исчезают,
+                // и человек видит «инструмента нет», а не «сервер недоступен».
+                // Для аудита это разные факты, поэтому событие, а не только
+                // stderr, который никто не читает (находка ревью M2-full).
                 Ok(Err(e)) => {
                     tracing::warn!(server = %name, error = %e, "tools/list failed; server excluded");
+                    self.mark_unreachable(name, &format!("tools/list failed: {e}"));
                 }
                 Err(_) => {
                     tracing::warn!(
                         server = %name,
                         timeout_ms = self.list_timeout.as_millis() as u64,
                         "tools/list timed out; server excluded from this listing"
+                    );
+                    self.mark_unreachable(
+                        name,
+                        &format!(
+                            "tools/list timed out after {}ms",
+                            self.list_timeout.as_millis()
+                        ),
                     );
                 }
             }
@@ -707,7 +746,7 @@ impl ServerHandler for Gateway {
                     tool,
                     &args,
                     decision.as_ref(),
-                    CallOutcome::abandoned(duration_ms),
+                    CallOutcome::abandoned(duration_ms).because(reason),
                 );
                 return Ok(Self::tool_error(format!(
                     "stopped waiting for downstream '{server}' after {duration_ms}ms ({reason}); \
@@ -722,7 +761,7 @@ impl ServerHandler for Gateway {
                     tool,
                     &args,
                     decision.as_ref(),
-                    CallOutcome::failed(duration_ms),
+                    CallOutcome::failed(duration_ms).because(format!("unreachable: {e}")),
                 );
                 return Ok(Self::tool_error(format!(
                     "could not reach downstream '{server}': {e}; the call did not happen"
@@ -805,6 +844,7 @@ impl ServerHandler for Gateway {
                         result_bytes,
                         is_error,
                         abandoned: false,
+                        reason: None,
                     },
                 );
                 Ok(response)
@@ -899,6 +939,7 @@ impl ServerHandler for Gateway {
                         result_bytes,
                         is_error: false,
                         abandoned: false,
+                        reason: None,
                     },
                 );
                 Ok(ReadResourceResponse::Complete(result))
@@ -1006,6 +1047,7 @@ impl ServerHandler for Gateway {
                         result_bytes,
                         is_error: false,
                         abandoned: false,
+                        reason: None,
                     },
                 );
                 Ok(GetPromptResponse::Complete(result))

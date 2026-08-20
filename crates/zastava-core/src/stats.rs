@@ -44,6 +44,14 @@ pub struct StatsSummary {
     pub annotations: u64,
     /// Ослаблений политики на живом reload (enforce -> warn, снятие правил).
     pub weakenings: u64,
+    /// Сколько раз downstream-сервер оказывался недоступен: не поднялся или
+    /// выпал из выдачи инструментов. Без этой строки его инструменты просто
+    /// «исчезают», и человек ищет причину не там (находка ревью M2-full).
+    pub unreachable: u64,
+    /// Сколько раз downstream просил у пользователя то, что застава не
+    /// пересылает (sampling / roots / elicitation). Попытка сервера
+    /// обратиться к человеку — событие, о котором стоит знать.
+    pub reverse_refused: u64,
     /// Уникальных сигнатур С УЧЁТОМ хэша аргументов. `canonical_subset`
     /// покрывает только ключи-идентификаторы, поэтому счёт по нему схлопывает
     /// вызовы, различающиеся остальными аргументами, и завышает выгоду
@@ -71,6 +79,8 @@ pub fn summarize(records: &[CallRecord]) -> StatsSummary {
             match record.tool.as_str() {
                 "annotation" => summary.annotations += 1,
                 "policy_weakened" => summary.weakenings += 1,
+                "downstream_failed" | "downstream_unreachable" => summary.unreachable += 1,
+                "reverse_request_refused" => summary.reverse_refused += 1,
                 _ => {}
             }
             continue;

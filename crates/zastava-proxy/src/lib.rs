@@ -68,23 +68,22 @@ pub async fn run(config: Config, options: RunOptions) -> Result<(), ProxyError> 
     let resource_owners = Arc::new(RwLock::new(HashMap::new()));
     let lists =
         downstream::ListChangedHub::new(upstream.clone(), resource_owners.clone(), log.clone());
+    // Всё общее — одним свёртком: связей стало четыре, и тащить их россыпью
+    // через `spawn_downstream` значило бы менять сигнатуру на каждом новом.
+    let shared = downstream::Shared {
+        upstream: upstream.clone(),
+        progress: progress.clone(),
+        lists,
+        log: log.clone(),
+    };
 
     // Eager parallel spawn (T6.4): опоздавшие/упавшие не валят остальных.
     let mut join_set = tokio::task::JoinSet::new();
     for (name, server_config) in config.servers.clone() {
-        let slot = upstream.clone();
-        let bridge = progress.clone();
-        let hub = lists.clone();
+        let shared = shared.clone();
         join_set.spawn(async move {
-            let result = spawn::spawn_downstream(
-                &name,
-                &server_config,
-                initialize_timeout,
-                slot,
-                bridge,
-                hub,
-            )
-            .await;
+            let result =
+                spawn::spawn_downstream(&name, &server_config, initialize_timeout, shared).await;
             (name, result)
         });
     }
@@ -101,12 +100,23 @@ pub async fn run(config: Config, options: RunOptions) -> Result<(), ProxyError> 
                 // спрашивают «а какие версии там были».
                 if let Some(log) = &log {
                     let info = downstream.service.peer_info();
+                    // Имя и версию выбирает САМ СЕРВЕР — это недоверенный
+                    // текст, и в журнал он обязан идти экранированным, как
+                    // имена инструментов. Иначе управляющие символы в имени
+                    // переписывают вывод `stats`/`events`, где эти же записи
+                    // и читают (тот же класс, что был закрыт в M1 для имён
+                    // инструментов; здесь его пропустили).
+                    let mut dirty = false;
                     let detail = match info {
                         Some(info) => {
-                            let (server, version) = match &info.server_info {
+                            let (raw_name, raw_version) = match &info.server_info {
                                 Some(impl_) => (impl_.name.as_str(), impl_.version.as_str()),
                                 None => ("<unnamed>", "<unknown>"),
                             };
+                            let (server, n_dirty) = zastava_core::config::sanitize_name(raw_name);
+                            let (version, v_dirty) =
+                                zastava_core::config::sanitize_name(raw_version);
+                            dirty = n_dirty || v_dirty;
                             format!(
                                 "{name}: {server} {version} (protocol {})",
                                 info.protocol_version
@@ -114,12 +124,14 @@ pub async fn run(config: Config, options: RunOptions) -> Result<(), ProxyError> 
                         }
                         None => format!("{name}: peer info unavailable"),
                     };
-                    log.write(zastava_core::CallRecord::marker(
+                    let mut record = zastava_core::CallRecord::marker(
                         util::now_rfc3339(),
                         util::next_event_id(),
                         "downstream_up",
                         Some(detail),
-                    ));
+                    );
+                    record.name_sanitized = dirty;
+                    log.write(record);
                 }
                 downstreams.insert(name, downstream.service);
             }

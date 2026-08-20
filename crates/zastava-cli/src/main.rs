@@ -387,6 +387,18 @@ fn stats(path: &Path) -> anyhow::Result<()> {
     if summary.annotations > 0 {
         println!("  заметок annotate:    {}", summary.annotations);
     }
+    if summary.unreachable > 0 {
+        println!(
+            "  недоступных серверов: {} (инструменты пропадали из выдачи)",
+            summary.unreachable
+        );
+    }
+    if summary.reverse_refused > 0 {
+        println!(
+            "  отказов серверам:    {} (просили sampling/roots/elicitation у тебя)",
+            summary.reverse_refused
+        );
+    }
     if summary.weakenings > 0 {
         println!(
             "  ОСЛАБЛЕНИЙ политики: {} (см. маркеры policy_weakened в журнале)",

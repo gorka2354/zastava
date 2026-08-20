@@ -400,47 +400,37 @@ impl ListChangedHub {
     }
 }
 
+/// Всё общее, что downstream-обработчик получает от гейтвея.
+///
+/// Отдельный тип, потому что этих связей стало четыре и они одинаковы для
+/// всех downstream'ов: тащить их россыпью через `spawn_downstream` значило бы
+/// менять сигнатуру при каждом новом мосте.
+#[derive(Clone, Default)]
+pub struct Shared {
+    /// Пир настоящего клиента; заполняется после его подключения.
+    pub upstream: UpstreamSlot,
+    /// Перевод progress-токенов между downstream'ом и клиентом.
+    pub progress: ProgressBridge,
+    /// Пересылка уведомлений об изменении списков.
+    pub lists: ListChangedHub,
+    /// Журнал: отказ downstream'у — тоже событие аудита.
+    pub log: Option<LogHandle>,
+}
+
 /// Обработчик клиент-роли для одного downstream-сервера.
 #[derive(Clone)]
 pub struct DownstreamHandler {
-    /// Имя сервера из конфига — попадает в диагностику и (позже) в аудит.
+    /// Имя сервера из конфига — попадает в диагностику и в аудит.
     name: String,
-    /// Пир настоящего клиента; заполняется после его подключения.
-    #[allow(dead_code)] // задействуется в W4 (пересылка обратных запросов)
-    upstream: UpstreamSlot,
-    /// Перевод progress-токенов между downstream'ом и клиентом.
-    progress: ProgressBridge,
-    /// Пересылка уведомлений об изменении списков.
-    lists: ListChangedHub,
+    shared: Shared,
 }
 
 impl DownstreamHandler {
     /// Создаёт обработчик для сервера `name`.
-    pub fn new(name: impl Into<String>, upstream: UpstreamSlot) -> Self {
-        Self::with_progress(name, upstream, ProgressBridge::new())
-    }
-
-    /// Тот же обработчик, но с общим мостом прогресса.
-    pub fn with_progress(
-        name: impl Into<String>,
-        upstream: UpstreamSlot,
-        progress: ProgressBridge,
-    ) -> Self {
-        Self::with_bridges(name, upstream, progress, ListChangedHub::default())
-    }
-
-    /// Полный конструктор: общие мост прогресса и хаб списков.
-    pub fn with_bridges(
-        name: impl Into<String>,
-        upstream: UpstreamSlot,
-        progress: ProgressBridge,
-        lists: ListChangedHub,
-    ) -> Self {
+    pub fn new(name: impl Into<String>, shared: Shared) -> Self {
         Self {
             name: name.into(),
-            upstream,
-            progress,
-            lists,
+            shared,
         }
     }
 
@@ -455,6 +445,21 @@ impl DownstreamHandler {
             method,
             "downstream asked the client for something zastava does not forward yet"
         );
+        // Попытка сервера обратиться к пользователю — событие аудита, даже
+        // когда мы её отклонили. Иначе «сервер просил у меня доступ к корневым
+        // каталогам» останется известным только stderr'у, который никто не
+        // читает (находка ревью M2-full).
+        if let Some(log) = &self.shared.log {
+            let (server, dirty) = zastava_core::config::sanitize_name(&self.name);
+            let mut record = CallRecord::marker(
+                now_rfc3339(),
+                next_event_id(),
+                "reverse_request_refused",
+                Some(format!("{server}: {method}")),
+            );
+            record.name_sanitized = dirty;
+            log.write(record);
+        }
         // `ErrorData::method_not_found::<M>()` требует const-строку типом;
         // нам нужно имя метода в рантайме, поэтому собираем код руками.
         ErrorData::new(
@@ -466,6 +471,16 @@ impl DownstreamHandler {
 }
 
 impl ClientHandler for DownstreamHandler {
+    fn get_info(&self) -> rmcp::model::ClientInfo {
+        // По умолчанию rmcp представляется downstream'у как «rmcp 3.1.3».
+        // Сервер, который логирует своих клиентов или ведёт себя по-разному
+        // для разных, видел бы библиотеку вместо гейтвея — а через заставу
+        // ходит не библиотека, а конкретный посредник с политикой.
+        let mut info = rmcp::model::ClientInfo::default();
+        info.client_info = rmcp::model::Implementation::new("zastava", env!("CARGO_PKG_VERSION"));
+        info
+    }
+
     async fn create_message(
         &self,
         _params: CreateMessageRequestParams,
@@ -503,19 +518,19 @@ impl ClientHandler for DownstreamHandler {
         // Уведомление — не запрос: отвечать некому и ждать нечего. Просто
         // переводим токен и отправляем дальше. Имя сервера обязательно:
         // без него токены разных downstream'ов сливаются в один ключ.
-        self.progress.relay(&self.name, params).await;
+        self.shared.progress.relay(&self.name, params).await;
     }
 
     async fn on_tool_list_changed(&self, _context: NotificationContext<RoleClient>) {
-        self.lists.notify(&self.name, ListKind::Tools);
+        self.shared.lists.notify(&self.name, ListKind::Tools);
     }
 
     async fn on_resource_list_changed(&self, _context: NotificationContext<RoleClient>) {
-        self.lists.notify(&self.name, ListKind::Resources);
+        self.shared.lists.notify(&self.name, ListKind::Resources);
     }
 
     async fn on_prompt_list_changed(&self, _context: NotificationContext<RoleClient>) {
-        self.lists.notify(&self.name, ListKind::Prompts);
+        self.shared.lists.notify(&self.name, ListKind::Prompts);
     }
 }
 

@@ -79,6 +79,12 @@ pub struct CallRecord {
     /// Такая запись не доказывает, что вызов не состоялся.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub abandoned: bool,
+    /// ПОЧЕМУ вызов брошен или не состоялся: таймаут, отмена клиентом, смерть
+    /// downstream'а, недоступность. Без этого поля все неудачи в журнале
+    /// выглядели одинаково, и разбор инцидента упирался в «что-то пошло не
+    /// так» (находка ревью M2-full).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 impl Default for CallRecord {
@@ -100,6 +106,7 @@ impl Default for CallRecord {
             result_bytes: 0,
             is_error: false,
             abandoned: false,
+            reason: None,
             name_sanitized: false,
         }
     }
@@ -162,6 +169,7 @@ mod tests {
             result_bytes: 1024,
             is_error: false,
             abandoned: false,
+            reason: None,
             name_sanitized: false,
         }
     }
