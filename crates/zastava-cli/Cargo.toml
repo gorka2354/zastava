@@ -1,6 +1,9 @@
 [package]
-name = "zastava-cli"
-description = "Zastava CLI: run / check / stats / allow / annotate / import."
+name = "zastava"
+description = "MCP gateway with argument-level policies, audit log and rule learning."
+keywords = ["mcp", "ai", "security", "policy", "gateway"]
+categories = ["command-line-utilities", "development-tools"]
+readme = "../../README.md"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

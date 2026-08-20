@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
 members = ["crates/zastava-core", "crates/zastava-proxy", "crates/zastava-cli"]
+# Каталог crates/zastava-cli намеренно оставлен: пакет в нём называется
+# `zastava` — так имя занимается на crates.io и работает `cargo install zastava`.
 exclude = ["spike"]
 
 [workspace.package]
@@ -12,8 +14,8 @@ repository = "https://github.com/gorka2354/zastava"
 authors = ["gorka2354"]
 
 [workspace.dependencies]
-zastava-core = { path = "crates/zastava-core" }
-zastava-proxy = { path = "crates/zastava-proxy" }
+zastava-core = { path = "crates/zastava-core", version = "0.1.0-dev" }
+zastava-proxy = { path = "crates/zastava-proxy", version = "0.1.0-dev" }
 thiserror = "2"
 serde_json = "1"
 sha2 = "0.10"
