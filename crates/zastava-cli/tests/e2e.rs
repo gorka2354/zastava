@@ -28,8 +28,25 @@ fn write_config(dir: &tempfile::TempDir, policy: &str, pid_file: Option<&Path>) 
         ));
     }
     env_line.push_str(" }");
+    // Путь журнала задаётся ВСЕГДА и внутрь временного каталога.
+    //
+    // Без этого `zastava run` резолвит журнал по умолчанию — то есть в
+    // БОЕВОЙ журнал пользователя, и каждый `cargo test` подмешивает туда
+    // записи тестовых фикстур. Для продукта, чей товар — доказательство
+    // происходившего, загрязнять пользовательский аудит прогоном тестов
+    // недопустимо. Поймано на живом недельном эксперименте: в журнале
+    // нашлись вызовы сервера `alpha`, которого у пользователя нет.
+    //
+    // Тест, которому журнал нужен для проверок, передаёт свой путь через
+    // `policy` — тогда дефолт не добавляем, иначе выйдет дубль секции.
+    let default_log = dir.path().join("calls.jsonl");
+    let log_section = if policy.contains("[log]") {
+        String::new()
+    } else {
+        format!("[log]\npath = {:?}\n\n", default_log.to_string_lossy())
+    };
     let content = format!(
-        "[servers.alpha]\ncommand = {:?}\n{env_line}\n\n{policy}",
+        "[servers.alpha]\ncommand = {:?}\n{env_line}\n\n{log_section}{policy}",
         fixture_path()
     );
     let path = dir.path().join("zastava.toml");

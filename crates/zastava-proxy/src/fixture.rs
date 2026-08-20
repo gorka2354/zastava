@@ -201,9 +201,13 @@ impl rmcp::ServerHandler for RichFixture {
         _request: Option<rmcp::model::PaginatedRequestParams>,
         _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
     ) -> Result<rmcp::model::ListResourcesResult, rmcp::model::ErrorData> {
-        let resource = rmcp::model::Resource::new("mem://note", "note");
+        let note = rmcp::model::Resource::new("mem://note", "note");
+        // Ресурс, который значится в списке, но при чтении отвечает ошибкой
+        // с КОНКРЕТНЫМ кодом. Нужен, чтобы проверить: гейтвей переносит код
+        // наверх, а не схлопывает всё в internal_error.
+        let broken = rmcp::model::Resource::new("mem://broken", "broken");
         Ok(
-            rmcp::model::ListResourcesResult::with_all_items(vec![resource])
+            rmcp::model::ListResourcesResult::with_all_items(vec![note, broken])
                 .with_ttl_ms(0)
                 .with_cache_scope(rmcp::model::CacheScope::Private),
         )
@@ -214,6 +218,14 @@ impl rmcp::ServerHandler for RichFixture {
         request: rmcp::model::ReadResourceRequestParams,
         _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
     ) -> Result<rmcp::model::ReadResourceResponse, rmcp::model::ErrorData> {
+        if request.uri == "mem://broken" {
+            // Осмысленный код, а не «внутренняя ошибка»: клиент должен уметь
+            // отличить «ресурса нет» от «сломался посредник».
+            return Err(rmcp::model::ErrorData::resource_not_found(
+                "note was deleted",
+                None,
+            ));
+        }
         if request.uri != "mem://note" {
             return Err(rmcp::model::ErrorData::invalid_params("unknown uri", None));
         }

@@ -367,7 +367,11 @@ async fn resources_and_prompts_are_proxied() {
 
     let resources = client.list_resources(Default::default()).await.unwrap();
     let uris: Vec<String> = resources.resources.iter().map(|r| r.uri.clone()).collect();
-    assert_eq!(uris, vec!["mem://note"], "URI остаётся немодифицированным");
+    assert_eq!(
+        uris,
+        vec!["mem://note", "mem://broken"],
+        "URI остаётся немодифицированным"
+    );
 
     let read = client
         .read_resource(rmcp::model::ReadResourceRequestParams::new("mem://note"))
@@ -863,5 +867,34 @@ keys = ["collection"]
     assert!(
         record.name_sanitized,
         "факт экранирования имени фиксируется"
+    );
+}
+
+#[tokio::test]
+async fn downstream_error_codes_survive_the_proxy() {
+    // Раньше любая ошибка downstream'а схлопывалась в internal_error, и клиент
+    // не мог отличить «такого ресурса нет» от «сломался прокси»: чтение
+    // несуществующего ресурса выглядело внутренней аварией гейтвея. Код
+    // ошибки — часть контракта протокола, посредник не вправе его терять.
+    let mut downstreams = HashMap::new();
+    downstreams.insert("rich".to_string(), serve_fixture(RichFixture).await);
+    let client = gateway_over(downstreams, 2_000).await;
+
+    // Прогреваем карту владельцев: ресурсы маршрутизируются по ней.
+    let _ = client.list_resources(Default::default()).await;
+
+    let err = client
+        .read_resource(rmcp::model::ReadResourceRequestParams::new("mem://broken"))
+        .await
+        .expect_err("фикстура обязана ответить ошибкой");
+
+    let text = err.to_string();
+    assert!(
+        !text.contains("Internal error") && !text.contains("-32603"),
+        "код downstream'а не должен подменяться внутренней ошибкой: {text}"
+    );
+    assert!(
+        text.contains("deleted"),
+        "сообщение downstream'а должно дойти до клиента: {text}"
     );
 }

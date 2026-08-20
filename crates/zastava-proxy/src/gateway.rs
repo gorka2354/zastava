@@ -372,6 +372,26 @@ impl Gateway {
     }
 }
 
+/// Переносит ошибку downstream'а наверх, СОХРАНЯЯ её код.
+///
+/// Раньше здесь стоял безусловный `internal_error`, и клиент не мог отличить
+/// «такого ресурса нет» от «сломался прокси»: любое чтение несуществующего
+/// ресурса выглядело внутренней аварией гейтвея. Код ошибки — часть контракта
+/// протокола, и посредник не имеет права его терять (находка разведки M2-full).
+///
+/// Транспортные ошибки кодом не обладают — они и остаются internal_error,
+/// потому что для клиента это действительно авария посредника.
+fn downstream_error(context: String, e: &ServiceError) -> ErrorData {
+    match e {
+        ServiceError::McpError(inner) => ErrorData::new(
+            inner.code,
+            format!("{context}: {}", inner.message),
+            inner.data.clone(),
+        ),
+        other => ErrorData::internal_error(format!("{context}: {other}"), None),
+    }
+}
+
 /// Объявляем только те возможности, которые реально есть хотя бы у одного
 /// downstream: обещать клиенту resources/prompts, которых никто не отдаёт, —
 /// врать (клиент будет слать запросы, на которые придёт пустота).
@@ -523,58 +543,93 @@ impl ServerHandler for Gateway {
             )
             .await;
 
-        enum Stop {
-            // Boxed: ServerResult заметно больше остальных вариантов.
+        /// Чем закончился форвард вызова вниз.
+        ///
+        /// Тип существует, чтобы исход НЕ МОГ соврать. Раньше три разных
+        /// события — таймаут, отмена клиентом и смерть downstream'а — все
+        /// подставляли `ServiceError::UnexpectedResponse`, и в журнал уходило
+        /// «failed: Unexpected response type» там, где на самом деле вызов
+        /// МОГ СОСТОЯТЬСЯ. Для продукта, чей товар — доказательство
+        /// происходившего, это худший сорт ошибки (находка разведки M2-full).
+        enum Forwarded {
+            /// Downstream ответил — успехом или собственной ошибкой.
+            /// Boxed: `ServerResult` заметно больше остальных вариантов.
             Answered(Box<Result<ServerResult, ServiceError>>),
-            Timeout,
-            ClientCancelled,
+            /// Запрос УШЁЛ, ответа нет. Побочный эффект мог состояться.
+            Abandoned(&'static str),
+            /// Отправить не удалось: вызов ТОЧНО не состоялся.
+            NotSent(ServiceError),
         }
 
-        let mut abandoned_reason: Option<&'static str> = None;
-        let outcome = match sent {
-            Err(e) => Err(e),
+        let forwarded = match sent {
+            Err(e) => Forwarded::NotSent(e),
             Ok(mut handle) => {
+                enum Stop {
+                    Answered(Box<Result<ServerResult, ServiceError>>),
+                    Timeout,
+                    ClientCancelled,
+                    Died,
+                }
                 let stop = tokio::select! {
                     biased;
                     _ = context.ct.cancelled() => Stop::ClientCancelled,
                     _ = tokio::time::sleep(self.call_timeout) => Stop::Timeout,
                     answered = &mut handle.rx => match answered {
                         Ok(result) => Stop::Answered(Box::new(result)),
-                        Err(_) => Stop::Answered(Box::new(Err(ServiceError::UnexpectedResponse))),
+                        // Канал закрыт, а ответа не было: downstream исчез
+                        // посреди запроса. Запрос при этом уже ушёл к нему.
+                        Err(_) => Stop::Died,
                     },
                 };
                 match stop {
-                    Stop::Answered(result) => *result,
+                    Stop::Answered(result) => Forwarded::Answered(result),
                     Stop::Timeout => {
-                        abandoned_reason = Some("zastava call timeout");
                         let _ = handle
                             .cancel(Some("zastava call timeout".to_string()))
                             .await;
-                        Err(ServiceError::UnexpectedResponse)
+                        Forwarded::Abandoned("zastava call timeout")
                     }
                     Stop::ClientCancelled => {
-                        abandoned_reason = Some("client cancelled");
                         let _ = handle.cancel(Some("client cancelled".to_string())).await;
-                        Err(ServiceError::UnexpectedResponse)
+                        Forwarded::Abandoned("client cancelled")
                     }
+                    // Отменять некому — процесс уже мёртв.
+                    Stop::Died => Forwarded::Abandoned("downstream died mid-request"),
                 }
             }
         };
         let duration_ms = started.elapsed().as_millis() as u64;
 
-        if let Some(reason) = abandoned_reason {
-            self.record(
-                server,
-                tool,
-                &args,
-                decision.as_ref(),
-                CallOutcome::abandoned(duration_ms),
-            );
-            return Ok(Self::tool_error(format!(
-                "stopped waiting for downstream '{server}' after {duration_ms}ms ({reason}); \
-                 cancellation was sent, but the call may still have taken effect"
-            )));
-        }
+        let outcome = match forwarded {
+            Forwarded::Abandoned(reason) => {
+                self.record(
+                    server,
+                    tool,
+                    &args,
+                    decision.as_ref(),
+                    CallOutcome::abandoned(duration_ms),
+                );
+                return Ok(Self::tool_error(format!(
+                    "stopped waiting for downstream '{server}' after {duration_ms}ms ({reason}); \
+                     the call may still have taken effect"
+                )));
+            }
+            Forwarded::NotSent(e) => {
+                // Отличается от предыдущего случая принципиально: сюда вызов
+                // не дошёл, побочного эффекта быть не могло.
+                self.record(
+                    server,
+                    tool,
+                    &args,
+                    decision.as_ref(),
+                    CallOutcome::failed(duration_ms),
+                );
+                return Ok(Self::tool_error(format!(
+                    "could not reach downstream '{server}': {e}; the call did not happen"
+                )));
+            }
+            Forwarded::Answered(result) => *result,
+        };
 
         match outcome {
             Err(ServiceError::Timeout { .. }) => {
@@ -756,9 +811,9 @@ impl ServerHandler for Gateway {
                     None,
                     CallOutcome::failed(duration_ms),
                 );
-                Err(ErrorData::internal_error(
-                    format!("downstream '{owner}' failed to read {uri}: {e}"),
-                    None,
+                Err(downstream_error(
+                    format!("downstream '{owner}' failed to read {uri}"),
+                    &e,
                 ))
             }
             Err(_) => {
@@ -863,9 +918,9 @@ impl ServerHandler for Gateway {
                     None,
                     CallOutcome::failed(duration_ms),
                 );
-                Err(ErrorData::internal_error(
-                    format!("downstream '{server}' failed to get prompt: {e}"),
-                    None,
+                Err(downstream_error(
+                    format!("downstream '{server}' failed to get prompt"),
+                    &e,
                 ))
             }
             Err(_) => {
