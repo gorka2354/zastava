@@ -824,7 +824,7 @@ fn write_private(path: &Path, content: &str) -> anyhow::Result<()> {
         // (import --force поверх старого) права надо выставить явно, иначе
         // токены из env остаются читаемыми всем (находка верификации M1).
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-        return Ok(());
+        Ok(())
     }
     #[cfg(not(unix))]
     {
