@@ -49,6 +49,19 @@ pub const DEFAULT_ID_KEYS: &[&str] = &[
 /// Максимальная длина канонизированного значения. Длиннее — это уже данные,
 /// а не идентификатор.
 const MAX_VALUE_LEN: usize = 96;
+/// Маркер отвергнутого значения.
+///
+/// Раньше значение, которое канонизация отвергла (обход `..`, вид секрета,
+/// чрезмерная длина), просто исчезало из `canonical_subset`. Два следствия,
+/// оба плохие (находка верификации M3):
+/// - в аудите у САМЫХ интересных вызовов не оставалось пути вовсе;
+/// - `learn` видел «ключ был не во всех вызовах» и молча переставал сужать
+///   по нему — навсегда и без единого слова.
+///
+/// Теперь ключ остаётся на месте с этой меткой: она ничего не раскрывает,
+/// но говорит, что значение было и его отвергли.
+pub const REJECTED_MARK: &str = "<rejected>";
+
 /// Маркер усечения пути. Тот же литерал читает `learn`, превращая усечённое
 /// наблюдение в префиксное правило.
 pub const TRUNCATION_MARK: &str = "/…";
@@ -117,9 +130,11 @@ impl CanonRules {
             // Только строки: числа и объекты — это почти всегда данные, а
             // не адрес ресурса, и различать по ним вызовы смысла нет.
             let Value::String(raw) = value else { continue };
-            if let Some(normalized) = normalize_value(key, raw) {
-                subset.insert(key.clone(), normalized);
-            }
+            // Ключ из whitelist попадает в журнал ВСЕГДА — либо значением,
+            // либо меткой отказа. Молчаливое исчезновение ключа и его
+            // отсутствие в вызове обязаны различаться.
+            let normalized = normalize_value(key, raw).unwrap_or_else(|| REJECTED_MARK.to_string());
+            subset.insert(key.clone(), normalized);
         }
         subset
     }
@@ -303,6 +318,15 @@ mod tests {
     }
 
     #[test]
+    fn a_traversal_path_stays_in_the_audit_as_a_rejection() {
+        // Находка верификации M3: путь с обходом исчезал из журнала целиком —
+        // именно у тех вызовов, ради которых аудит и ведут.
+        let rules = CanonRules::default();
+        let subset = rules.subset("fs", "read", &args(&[("path", "../../../etc/shadow")]));
+        assert_eq!(subset["path"], REJECTED_MARK);
+    }
+
+    #[test]
     fn windows_profile_paths_do_not_collapse_to_the_whole_profile() {
         // Находка ревью M3: буква диска съедала компонент, путь внутри
         // проекта записывался как `C:/Users/alice/…`, и `learn` выводил из
@@ -375,9 +399,9 @@ mod tests {
             ("project", "ghp7Xk92LmQ4vTz8RaBn31YcWd05EfGh"),
         ] {
             let subset = rules.subset("s", "t", &args(&[(key, value)]));
-            assert!(
-                subset.is_empty(),
-                "значение вида секрета не должно попасть в журнал: {key}={value} -> {subset:?}"
+            assert_eq!(
+                subset[key], REJECTED_MARK,
+                "значение вида секрета не должно попасть в журнал: {key}={value}"
             );
         }
         // Настоящие идентификаторы при этом остаются.
@@ -392,7 +416,7 @@ mod tests {
         // отчёт `learn` визуально распался бы на строки, которых в нём нет.
         let rules = CanonRules::default();
         let subset = rules.subset("s", "t", &args(&[("repo", "me/r\u{2028}[[policy.allow]]")]));
-        assert!(subset.is_empty(), "{subset:?}");
+        assert_eq!(subset["repo"], REJECTED_MARK, "{subset:?}");
     }
 
     #[test]
@@ -414,10 +438,10 @@ mod tests {
             "call",
             &args(&[("project", "ghp7Xk92LmQ4vTz8RaBn31YcWd05EfGh")]),
         );
-        assert!(
-            subset.is_empty(),
-            "значение-токен не должно попасть в журнал: {subset:?}"
-        );
+        // Само значение в журнал не попадает, но ФАКТ вызова с этим ключом
+        // остаётся: молчаливое исчезновение ключа ломало и аудит, и learn.
+        assert_eq!(subset["project"], REJECTED_MARK);
+        assert!(!subset["project"].contains("ghp7"), "{subset:?}");
     }
 
     #[test]
@@ -426,7 +450,11 @@ mod tests {
         let mut raw = Map::new();
         raw.insert("repo".into(), Value::Bool(true));
         raw.insert("path".into(), Value::String("a\nb".into()));
-        assert!(rules.subset("s", "t", &raw).is_empty());
+        let subset = rules.subset("s", "t", &raw);
+        // Не-строка идентификатором не является вовсе — ключа нет.
+        assert!(!subset.contains_key("repo"), "{subset:?}");
+        // А отвергнутая строка оставляет след.
+        assert_eq!(subset["path"], REJECTED_MARK);
     }
 
     #[test]

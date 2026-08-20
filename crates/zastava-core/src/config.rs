@@ -215,39 +215,47 @@ pub enum ArgMatcher {
 
 /// Совпадает ли значение с префиксным правилом.
 ///
-/// Сравниваются НЕ строки, а компоненты пути. Строковый `starts_with`
-/// пропускал два обхода, воспроизведённых на живом гейтвее (ревью M3):
-/// - `C:/work/zastava/../../Users/alice/.ssh` — `..` уводит наружу;
-/// - `C:/work/zastava-private` — соседний каталог, чьё имя просто начинается
-///   так же.
+/// Для ИЕРАРХИЧЕСКИХ значений (пути, URL) сравниваются компоненты, а не
+/// байты: строковый `starts_with` пропускал `C:/work/zastava/../../Users`
+/// и соседний каталог `C:/work/zastava-private`, чьё имя просто начинается
+/// так же (P1 всех трёх ревью M3).
 ///
-/// Поэтому: обе стороны раскладываются лексически ([`pathish::resolve`]),
-/// `..` схлопывается, выход за корень отвергается целиком, а совпадение
-/// обязано заканчиваться НА ГРАНИЦЕ компонента.
-///
-/// Регистр и `\` против `/` складываются: на Windows `C:\Work` и `c:/work` —
-/// одно место, и правило, чувствительное к регистру, обходилось бы его
-/// сменой. Приведение одинаково на всех платформах — политика обязана
-/// значить одно и то же на любой машине.
-///
-/// Точные матчеры (`exact`, `any_of`) остаются побайтовыми.
+/// Для плоских идентификаторов (`prod-`, `feature`) префикс остаётся
+/// обычным строковым: требовать там границу компонента значило бы молча
+/// отказывать законным вызовам — `prefix = "prod-"` перестал бы совпадать
+/// с `prod-a` (находка верификации M3).
 fn prefix_matches(prefix: &str, actual: &str) -> bool {
+    if !is_hierarchical(prefix) {
+        return actual.starts_with(prefix);
+    }
     let (Some(want), Some(got)) = (pathish::resolve(prefix), pathish::resolve(actual)) else {
-        // Значение или префикс вышли за собственный корень — не совпадение.
+        // Значение или префикс не разбираются как адрес — не совпадение.
         return false;
     };
-    let want = want.render().to_lowercase();
-    let got = got.render().to_lowercase();
+    let want_key = want.compare_key();
+    if want_key.is_empty() {
+        // Префикс вида "." или "a/.." схлопывается в пустоту и совпал бы с
+        // чем угодно. Валидация такое отклоняет, но матчер обязан быть
+        // устойчив и сам (находка верификации M3).
+        return false;
+    }
+    let got_key = got.compare_key();
 
-    if got == want {
+    if got_key == want_key {
         return true;
     }
-    let Some(tail) = got.strip_prefix(&want) else {
+    let Some(tail) = got_key.strip_prefix(&want_key) else {
         return false;
     };
-    // Граница: либо префикс сам ею кончается, либо остаток с неё начинается.
-    // Без этой проверки `zastava` покрывал бы `zastava-private`.
-    want.ends_with(pathish::is_boundary) || tail.starts_with(pathish::is_boundary)
+    // Граница берётся у ПРОВЕРЯЕМОГО значения: у пути это только `/`,
+    // у URL — ещё `?` и `#`.
+    want_key.ends_with(|c| got.is_boundary(c)) || tail.starts_with(|c| got.is_boundary(c))
+}
+
+/// Иерархическое ли значение: путь или URL. Плоский идентификатор границ
+/// компонентов не имеет, и накладывать их на него нечестно.
+fn is_hierarchical(value: &str) -> bool {
+    value.contains('/') || value.contains('\\') || value.contains("://")
 }
 
 /// `{ prefix = "..." }`.
@@ -297,6 +305,10 @@ impl ArgMatcher {
                     // Пустой префикс совпадает с чем угодно: это не сужение,
                     // а бесшумное «разрешить всё» с видом ограничения.
                     problems.push("empty prefix matches any value");
+                } else if pathish::resolve(&m.prefix).is_none_or(|r| r.compare_key().is_empty()) {
+                    // `.`, `./`, `a/..` выглядят как ограничение, а
+                    // схлопываются в пустоту (находка верификации M3).
+                    problems.push("prefix collapses to nothing and would match any path");
                 }
             }
             ArgMatcher::AnyOf(m) => {

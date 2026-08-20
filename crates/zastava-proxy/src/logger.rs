@@ -173,6 +173,26 @@ pub fn read_all_generations_counted(path: &Path) -> std::io::Result<(Vec<CallRec
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unreadable_lines_are_counted_not_silently_dropped() {
+        // Побитый журнал побайтово совпадал с пустым (`вызовов: 0`) — для
+        // инструмента, чей товар есть доказательство происходившего, это
+        // худший вид отказа (находка ревью M3).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("calls.jsonl");
+        std::fs::write(
+            &path,
+            "{\"kind\":\"call\",\"ts\":\"t\",\"id\":\"1\",\"server\":\"a\",\"tool\":\"b\"}
+             мусор
+             {\"нет\":\"полей\"}
+",
+        )
+        .expect("write");
+        let (records, unreadable) = super::read_counted(&path).expect("read");
+        assert_eq!(records.len(), 1);
+        assert_eq!(unreadable, 2);
+    }
+
     use super::*;
 
     fn record(id: &str) -> CallRecord {

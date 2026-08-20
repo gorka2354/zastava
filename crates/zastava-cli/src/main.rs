@@ -506,6 +506,13 @@ fn learn(path: &Path) -> anyhow::Result<()> {
         }
         println!();
     }
+    if !output.unnarrowable.is_empty() {
+        println!("# ⚠ Сузить не удалось — значения отвергнуты канонизацией:");
+        for item in &output.unnarrowable {
+            println!("#   {item}");
+        }
+        println!();
+    }
     if !output.foreign.is_empty() {
         println!("# ℹ Из журнала, но не из этого конфига (журнал общий на машину):");
         for sig in &output.foreign {
@@ -556,11 +563,21 @@ fn learn(path: &Path) -> anyhow::Result<()> {
     println!();
     println!("# --- в zastava.toml (вычеркни лишнее): ---");
     println!("{}", output.toml_snippet);
-    if output.proposals.iter().any(|p| p.is_narrowed()) && config.policy.mode == PolicyMode::Warn {
-        println!(
-            "# ℹ mode = \"warn\": новые правила пока только пишутся в журнал.\n\
-             #   Поживи с ними неделю, проверь `zastava stats`, потом mode = \"enforce\"."
-        );
+    // Правило ограничивает НАЗВАННЫЕ ключи; прочие свободны. Для инструмента
+    // с двумя путеподобными аргументами (`move_file`: path + destination)
+    // «сужено по path» сужением не является (находка верификации M3).
+    if output.proposals.iter().any(|p| p.is_narrowed()) {
+        println!("# ℹ Ограничены только перечисленные аргументы; остальные свободны.");
+        println!("#   Если у инструмента есть второй путь (destination, target) —");
+        println!("#   добавь в правило deny_extra_args = true.");
+        println!();
+    }
+    // Предупреждение печатается ВСЕГДА в warn-режиме, а не только при наличии
+    // суженных предложений: пользователь, вставивший tool-level правила, точно
+    // так же считает, что они его защищают (находка продуктового ревью M3).
+    if config.policy.mode == PolicyMode::Warn {
+        println!("# ⚠ mode = \"warn\": эти правила НИЧЕГО не блокируют, только пишутся в журнал.");
+        println!("#   Поживи с ними неделю, проверь `zastava stats`, потом mode = \"enforce\".");
         println!();
     }
     println!("# --- в settings.json клиента (per-tool через заставу): ---");

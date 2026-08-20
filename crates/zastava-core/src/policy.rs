@@ -390,6 +390,135 @@ args = { path = { prefix = "C:/work/zastava" } }
     }
 
     #[test]
+    fn hash_and_question_are_not_path_boundaries() {
+        // P1 верификации M3: `?` и `#` считались границей компонента и для
+        // файловых путей, поэтому каталог `zastava#private` проходил под
+        // правилом на `zastava`. Через junction на системный каталог это
+        // давало доступ ко всему диску без прав администратора.
+        let toml = r#"
+[servers.fs]
+command = "x"
+[policy]
+mode = "enforce"
+[[policy.allow]]
+sig = "fs__write"
+args = { path = { prefix = "C:/work/zastava" } }
+"#;
+        let e = engine(toml);
+        let verdict = |path: &str| e.decide("fs", "write", &args(&[("path", path)]));
+        assert!(verdict("C:/work/zastava#private/secrets.env").blocks());
+        assert!(verdict("C:/work/zastava?evil/x").blocks());
+        assert!(verdict("C:/work/zastava#esc/hosts").blocks());
+        // Внутри границы `#` в имени файла по-прежнему допустим.
+        assert!(!verdict("C:/work/zastava/issue#42.md").blocks());
+    }
+
+    #[test]
+    fn case_is_folded_only_where_the_namespace_itself_ignores_it() {
+        // На Windows `C:\Work` и `c:/work` — одно место, и правило, чувствительное
+        // к регистру, обходилось бы его сменой. На POSIX `/home/alice/PROJ` — ДРУГОЙ
+        // каталог, и складывать там регистр значит расширять правило за пределы
+        // написанного (находка верификации M3). Решает вид значения, а не текущая
+        // ОС: политика обязана значить одно и то же на любой машине.
+        let win = engine(
+            "[servers.fs]\ncommand = \"x\"\n[policy]\nmode = \"enforce\"\n[[policy.allow]]\nsig = \"fs__w\"\nargs = { path = { prefix = \"C:/work/zastava\" } }\n",
+        );
+        assert!(!win
+            .decide("fs", "w", &args(&[("path", r"c:\WORK\Zastava\x")]))
+            .blocks());
+
+        let posix = engine(
+            "[servers.fs]\ncommand = \"x\"\n[policy]\nmode = \"enforce\"\n[[policy.allow]]\nsig = \"fs__w\"\nargs = { path = { prefix = \"/home/alice/proj\" } }\n",
+        );
+        assert!(!posix
+            .decide("fs", "w", &args(&[("path", "/home/alice/proj/src/x")]))
+            .blocks());
+        assert!(
+            posix
+                .decide("fs", "w", &args(&[("path", "/home/alice/PROJ/secret")]))
+                .blocks(),
+            "на POSIX это другой каталог"
+        );
+    }
+
+    #[test]
+    fn backslash_in_url_authority_is_refused_rather_than_guessed() {
+        // `https://api.example.com\@evil.tld/x`: наш разбор давал хост
+        // api.example.com, а Python/Go/Java — evil.tld. Гейт разрешал бы вызов
+        // к одному хосту, downstream шёл бы к другому (обход allow-листа).
+        let e = engine(
+            "[servers.http]\ncommand = \"x\"\n[policy]\nmode = \"enforce\"\n[[policy.allow]]\nsig = \"http__get\"\nargs = { url = { prefix = \"https://api.example.com\" } }\n",
+        );
+        assert!(e
+            .decide(
+                "http",
+                "get",
+                &args(&[("url", r"https://api.example.com\@evil.tld/x")])
+            )
+            .blocks());
+    }
+
+    #[test]
+    fn a_prefix_that_collapses_to_nothing_matches_nothing() {
+        // `.` и `a/..` схлопываются в пустоту и совпали бы с любым путём.
+        for bad in [".", "./", "a/.."] {
+            let toml = format!(
+                "[servers.fs]\ncommand = \"x\"\n[policy]\nmode = \"enforce\"\n[[policy.allow]]\nsig = \"fs__w\"\nargs = {{ path = {{ prefix = \"{bad}\" }} }}\n"
+            );
+            // Такой конфиг обязан отвергаться на входе...
+            let err = Config::from_toml_str(&toml).unwrap_err();
+            assert!(
+                format!("{err}").contains("collapses to nothing"),
+                "{bad}: {err}"
+            );
+            // ...а сам матчер — не совпадать, даже если конфиг обошёл проверку.
+            let matcher = ArgMatcher::Prefix(crate::config::PrefixMatcher {
+                prefix: bad.to_string(),
+            });
+            assert!(!matcher.matches(&serde_json::json!("/etc/shadow")), "{bad}");
+        }
+    }
+
+    #[test]
+    fn flat_identifiers_keep_plain_string_prefix_semantics() {
+        // Граница компонента осмысленна для путей, но не для плоских
+        // идентификаторов: `prefix = "prod-"` обязан покрывать `prod-a`,
+        // иначе enforce тихо отказывает законным вызовам (находка
+        // верификации M3 — регрессия, внесённая фиксом границы).
+        let e = engine(
+            "[servers.k8s]\ncommand = \"x\"\n[policy]\nmode = \"enforce\"\n[[policy.allow]]\nsig = \"k8s__get\"\nargs = { namespace = { prefix = \"prod-\" } }\n",
+        );
+        assert!(!e
+            .decide("k8s", "get", &args(&[("namespace", "prod-a")]))
+            .blocks());
+        assert!(e
+            .decide("k8s", "get", &args(&[("namespace", "staging-a")]))
+            .blocks());
+
+        // А иерархический идентификатор границу сохраняет.
+        let repo = engine(
+            "[servers.gh]\ncommand = \"x\"\n[policy]\nmode = \"enforce\"\n[[policy.allow]]\nsig = \"gh__get\"\nargs = { repo = { prefix = \"gorka2354/\" } }\n",
+        );
+        assert!(!repo
+            .decide("gh", "get", &args(&[("repo", "gorka2354/zastava")]))
+            .blocks());
+    }
+
+    #[test]
+    fn encoded_traversal_and_drive_relative_paths_never_match() {
+        let e = engine(
+            "[servers.fs]\ncommand = \"x\"\n[policy]\nmode = \"enforce\"\n[[policy.allow]]\nsig = \"fs__w\"\nargs = { path = { prefix = \"C:/work/zastava\" } }\n",
+        );
+        let verdict = |path: &str| e.decide("fs", "w", &args(&[("path", path)]));
+        // Мы не декодируем, но downstream может — гейт не должен разрешать
+        // то, чего сам не проверил.
+        assert!(verdict("C:/work/zastava/%2e%2e/%2e%2e/Windows/x").blocks());
+        assert!(verdict("C:/work/zastava/..%2fWindows").blocks());
+        // `C:work` — относительно текущего каталога диска, который нам неизвестен.
+        assert!(verdict("C:work/zastava/x").blocks());
+    }
+
+    #[test]
     fn url_prefix_covers_paths_and_queries_but_not_other_hosts() {
         let toml = r#"
 [servers.http]

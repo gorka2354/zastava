@@ -67,6 +67,10 @@ pub struct LearnOutput {
     /// машину, а конфиги проектные — предложить такое правило означало бы
     /// сломать конфиг (`unknown server`) при вставке.
     pub foreign: Vec<String>,
+    /// Ключи, по которым сузить не удалось, потому что канонизация отвергла
+    /// их значения (обход `..`, вид секрета). Пользователь должен узнать, что
+    /// сужения нет ПОЧЕМУ, а не просто увидеть его отсутствие.
+    pub unnarrowable: Vec<String>,
     /// Сигнатуры с символами вне whitelist — в сниппеты НЕ попадают.
     /// Имя инструмента выбирает downstream, а сниппет пользователь копирует
     /// в конфиг: без этого фильтра враждебный сервер дописывал туда свои
@@ -157,13 +161,23 @@ pub fn suggest(records: &[CallRecord], config: &Config) -> LearnOutput {
         }
     }
 
+    let mut unnarrowable: Vec<String> = Vec::new();
     let proposals: Vec<Proposal> = seen
         .into_iter()
-        .map(|(sig, obs)| Proposal {
-            args: matchers_for(&sig, &obs),
-            calls: obs.calls,
-            legacy_calls: obs.legacy_calls,
-            sig,
+        .map(|(sig, obs)| {
+            for (key, values) in &obs.values {
+                if values.iter().any(|v| v == canon::REJECTED_MARK) {
+                    unnarrowable.push(format!(
+                        "{sig}: {key} — часть значений отвергнута канонизацией (обход пути или вид секрета)"
+                    ));
+                }
+            }
+            Proposal {
+                args: matchers_for(&sig, &obs),
+                calls: obs.calls,
+                legacy_calls: obs.legacy_calls,
+                sig,
+            }
         })
         .collect();
 
@@ -207,6 +221,7 @@ pub fn suggest(records: &[CallRecord], config: &Config) -> LearnOutput {
         proposals,
         toml_snippet,
         client_allow_snippet,
+        unnarrowable,
         narrowed: narrowed.into_iter().collect(),
         foreign: foreign.into_iter().collect(),
         suspicious: suspicious.into_iter().collect(),
@@ -234,6 +249,11 @@ fn matchers_for(sig: &str, obs: &Observations) -> Option<BTreeMap<String, ArgMat
             continue;
         }
         if values.iter().any(|v| !is_safe_value(v)) {
+            continue;
+        }
+        // Метка отказа — не значение: правило `path = "<rejected>"` не
+        // совпало бы ни с чем и выглядело бы сужением, которым не является.
+        if values.iter().any(|v| v == canon::REJECTED_MARK) {
             continue;
         }
         if let Some(matcher) = matcher_for_values(sig, key, values) {
@@ -346,21 +366,15 @@ fn is_safe_value(value: &str) -> bool {
 /// приходят от недоверенной стороны, и склейка строк здесь уже приводила к
 /// дописыванию чужих правил в конфиг пользователя.
 fn render_rule(rule: &RuleConfig) -> String {
+    // `toml_edit::ser` держит вложенные таблицы ЗНАЧЕНИЯМИ, поэтому `args`
+    // сам печатается inline и остаётся внутри своего блока. Ровно этого не
+    // умел `toml::to_string_pretty`: он выносил матчер отдельной стансой
+    // `[policy.allow.args.path]`, оторванной от `sig`, и инструкция
+    // «вычеркни лишнее» превращалась в ловушку (P1 ревью M3).
     let mut table = match toml_edit::ser::to_document(rule) {
         Ok(doc) => doc.as_table().clone(),
         Err(_) => return String::new(),
     };
-    // `args` из отдельной стансы превращается в inline-таблицу, чтобы жить
-    // на одной строке со своим правилом.
-    if let Some(args) = table.remove("args") {
-        if let Some(args_table) = args
-            .into_table()
-            .ok()
-            .map(toml_edit::Table::into_inline_table)
-        {
-            table.insert("args", toml_edit::Item::Value(args_table.into()));
-        }
-    }
     let mut array = toml_edit::ArrayOfTables::new();
     table.set_implicit(false);
     array.push(table);

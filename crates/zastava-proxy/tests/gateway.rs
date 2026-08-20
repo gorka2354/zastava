@@ -820,3 +820,48 @@ mode = \"warn\"
     );
     assert!(detail.contains("rules 1 -> 0"), "{detail}");
 }
+
+#[tokio::test]
+async fn canon_rules_are_found_by_the_raw_tool_name_not_the_escaped_one() {
+    // Находка верификации M3: политика решает по СЫРЫМ именам, а канонизация
+    // искала правило по ЭКРАНИРОВАННОМУ. Downstream, добавивший в имя символ
+    // вне whitelist, выпадал из своего точечного правила и попадал под общий
+    // (более широкий) — то есть недоверенная сторона решала, сколько её
+    // аргументов уедет в журнал открыто.
+    let config_toml = r#"
+[servers.alpha]
+command = "unused-in-tests"
+
+[[canon.rules]]
+sig = "alpha__read:file"
+keys = ["collection"]
+"#;
+    let gw = gateway_with_canon(config_toml).await;
+
+    // Инструмента с таким именем у фикстуры нет — downstream ответит ошибкой,
+    // но запись в аудит появится, а вместе с ней и канонический поднабор.
+    let _ = gw
+        .client
+        .call_tool(call(
+            "alpha__read:file",
+            serde_json::json!({"collection": "notes", "repo": "me/other"}),
+        ))
+        .await;
+
+    let records = wait_records(&gw.log_path, 1).await;
+    let record = records.iter().find(|r| r.is_call()).expect("call record");
+    assert!(
+        record.canonical_subset.contains_key("collection"),
+        "точечное правило обязано найтись: {:?}",
+        record.canonical_subset
+    );
+    assert!(
+        !record.canonical_subset.contains_key("repo"),
+        "общий whitelist не должен применяться поверх точечного правила: {:?}",
+        record.canonical_subset
+    );
+    assert!(
+        record.name_sanitized,
+        "факт экранирования имени фиксируется"
+    );
+}
