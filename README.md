@@ -1,5 +1,9 @@
 # zastava
 
+[![CI](https://github.com/gorka2354/zastava/actions/workflows/ci.yml/badge.svg)](https://github.com/gorka2354/zastava/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![MSRV 1.85](https://img.shields.io/badge/MSRV-1.85-orange.svg)
+
 **Work in progress (M3).** Застава — пограничный пункт досмотра для AI-агентов:
 single-binary MCP-гейтвей, который агрегирует ваши MCP-серверы за одним endpoint
 и добавляет то, чего не умеет клиентский `permissions.allow`.
