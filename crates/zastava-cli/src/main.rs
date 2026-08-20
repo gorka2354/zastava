@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
 use clap::{Parser, Subcommand};
-use zastava_core::config::{is_safe_sig, parse_sig, ServerConfig};
+use zastava_core::config::{is_safe_sig, parse_sig, ArgMatcher, PolicyMode, ServerConfig};
 use zastava_core::Config;
 
 /// Обёртка для сериализации импортированных серверов в TOML.
@@ -62,11 +62,12 @@ enum Command {
     /// Черновики правил из журнала: TOML для zastava.toml + сниппет
     /// клиентского permissions.allow.
     Learn,
-    /// Отметить срабатывание правила как полезное (в момент события). Появится в M3.
+    /// Отметить событие журнала как полезное или ложное — в момент события,
+    /// пока помнишь контекст.
     Annotate {
-        /// Идентификатор события из журнала.
+        /// Идентификатор события из журнала (колонка id).
         event_id: String,
-        /// Почему срабатывание было полезным.
+        /// Заметка: чем срабатывание помогло или почему оно ложное.
         note: String,
     },
     /// Импортировать stdio-серверы из .claude.json в zastava.toml.
@@ -97,7 +98,7 @@ fn main() -> anyhow::Result<()> {
         Command::Stats => stats(&config_path),
         Command::Allow { sig } => allow(&config_path, &sig),
         Command::Learn => learn(&config_path),
-        Command::Annotate { .. } => bail!("`zastava annotate` появится в M3"),
+        Command::Annotate { event_id, note } => annotate(&config_path, &event_id, &note),
         Command::Import { from, force } => import(&config_path, from.as_deref(), force),
     }
 }
@@ -324,19 +325,126 @@ fn learn(path: &Path) -> anyhow::Result<()> {
         }
         println!();
     }
-    if output.new_sigs.is_empty() {
+    if output.proposals.is_empty() {
         println!("Непокрытых сигнатур для этого конфига нет — предлагать нечего.");
         return Ok(());
     }
     println!(
         "# Непокрытые сигнатуры из журнала ({}):",
-        output.new_sigs.len()
+        output.proposals.len()
     );
+    for proposal in &output.proposals {
+        let calls = proposal.calls;
+        match &proposal.args {
+            Some(args) => {
+                let narrowing = args
+                    .iter()
+                    .map(|(key, matcher)| format!("{key} {}", describe_matcher(matcher)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                println!(
+                    "#   {} — {calls} вызов(ов), сужено: {narrowing}",
+                    proposal.sig
+                );
+            }
+            None => println!(
+                "#   {} — {calls} вызов(ов), сузить по аргументам нечем",
+                proposal.sig
+            ),
+        }
+    }
+    println!();
     println!("# --- в zastava.toml (вычеркни лишнее): ---");
     println!("{}", output.toml_snippet);
+    if output.proposals.iter().any(|p| p.is_narrowed()) && config.policy.mode == PolicyMode::Warn {
+        println!(
+            "# ℹ mode = \"warn\": новые правила пока только пишутся в журнал.\n\
+             #   Поживи с ними неделю, проверь `zastava stats`, потом mode = \"enforce\"."
+        );
+        println!();
+    }
     println!("# --- в settings.json клиента (per-tool через заставу): ---");
     println!("{}", output.client_allow_snippet);
     Ok(())
+}
+
+/// Дописывает в журнал заметку о событии.
+///
+/// Ценность гейта проверяется не в конце квартала, а в момент срабатывания:
+/// «этот deny спас меня от записи в чужой репозиторий» или «этот deny был
+/// ложным». Заметка — обычная строка журнала (маркер), поэтому она попадает
+/// и в ротацию, и в `stats`, и переживает рестарт.
+fn annotate(config_path: &Path, event_id: &str, note: &str) -> anyhow::Result<()> {
+    // event_id генерируем мы сами, но приходит он из аргументов командной
+    // строки: пускать в журнал произвольную строку нельзя — перевод строки
+    // разорвал бы JSONL-запись на две.
+    if event_id.is_empty()
+        || !event_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-')
+    {
+        bail!("event_id '{event_id}' не похож на идентификатор из журнала");
+    }
+    if note.trim().is_empty() {
+        bail!("пустая заметка");
+    }
+
+    let config = load_config(config_path)?;
+    let log_path = resolve_log_path(&config);
+    let records = match read_journal(&log_path)? {
+        Some(records) => records,
+        None => bail!("журнала ещё нет: {}", log_path.display()),
+    };
+    let target = records.iter().find(|r| r.id == event_id);
+    let detail = match target {
+        Some(record) if record.is_call() => {
+            format!("{}__{}: {note}", record.server, record.tool)
+        }
+        Some(_) => note.to_string(),
+        // Не молчим: неизвестный id почти всегда означает опечатку, и
+        // заметка «в никуда» хуже отказа — её потом не найти.
+        None => bail!(
+            "события '{event_id}' нет в журнале {} — проверь id",
+            log_path.display()
+        ),
+    };
+
+    let record = zastava_core::CallRecord::marker(
+        zastava_proxy::util::now_rfc3339(),
+        event_id.to_string(),
+        "annotation",
+        Some(detail),
+    );
+    let line = record.to_jsonl();
+    append_line(&log_path, &line)?;
+    println!("Записано: {event_id} — {note}");
+    Ok(())
+}
+
+/// Дописывает строку в журнал тем же способом, что и сам гейтвей: один
+/// `write_all` в режиме append. Заставa может работать прямо сейчас, и две
+/// строки не должны перемешаться.
+fn append_line(path: &Path, line: &str) -> anyhow::Result<()> {
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("cannot open journal {}", path.display()))?;
+    let mut buf = line.as_bytes().to_vec();
+    buf.push(b'\n');
+    file.write_all(&buf)
+        .with_context(|| format!("cannot append to journal {}", path.display()))?;
+    Ok(())
+}
+
+/// Человекочитаемое описание матчера для вывода `learn`.
+fn describe_matcher(matcher: &ArgMatcher) -> String {
+    match matcher {
+        ArgMatcher::Exact(value) => format!("= {value}"),
+        ArgMatcher::Prefix(m) => format!("начинается с {}", m.prefix),
+        ArgMatcher::AnyOf(m) => format!("одно из [{}]", m.any_of.join(", ")),
+    }
 }
 
 fn import(config_path: &Path, from: Option<&Path>, force: bool) -> anyhow::Result<()> {

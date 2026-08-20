@@ -34,8 +34,8 @@ use rmcp::service::{
 use rmcp::ServerHandler;
 use serde_json::{Map, Value};
 use zastava_core::config::{sanitize_name, NS_SEP};
-use zastava_core::signature::{canonical_subset, full_args_hash, CANON_VERSION};
-use zastava_core::{CallRecord, Decision, PolicyEngine, Verdict};
+use zastava_core::signature::{full_args_hash, CANON_VERSION};
+use zastava_core::{CallRecord, CanonRules, Decision, PolicyEngine, Verdict};
 
 use crate::logger::LogHandle;
 use crate::util::{next_event_id, now_rfc3339};
@@ -127,6 +127,17 @@ async fn list_one(name: &str, ds: &DownstreamService) -> Result<Vec<Tool>, Servi
     Ok(collected)
 }
 
+/// Опции журналирования гейтвея.
+#[derive(Debug, Clone, Default)]
+pub struct GatewayOptions {
+    /// Прозрачный режим: политика отключена (журнал — нет).
+    pub passthrough: bool,
+    /// Писать в журнал полные аргументы вызовов (опт-ин, см. `log.log_args`).
+    pub log_args: bool,
+    /// Правила канонизации аргументов.
+    pub canon: CanonRules,
+}
+
 /// Гейтвей: реализация ServerHandler поверх множества downstream'ов.
 pub struct Gateway {
     downstreams: HashMap<String, DownstreamService>,
@@ -136,6 +147,9 @@ pub struct Gateway {
     list_timeout: Duration,
     passthrough: bool,
     log_args: bool,
+    /// Правила канонизации аргументов для журнала. Читаются на каждом вызове
+    /// вместе с политикой; живут в Arc, потому что reload может их заменить.
+    canon: CanonRules,
     /// Возможности, вычисленные из реальных downstream'ов: объявлять
     /// resources/prompts, которых ни у кого нет, — врать клиенту.
     capabilities: ServerCapabilities,
@@ -176,21 +190,21 @@ impl Gateway {
             log,
             call_timeout,
             list_timeout,
-            passthrough,
-            false,
+            GatewayOptions {
+                passthrough,
+                ..GatewayOptions::default()
+            },
         )
     }
 
-    /// Полный конструктор: дополнительно принимает `log_args` (писать ли в
-    /// журнал полные аргументы вызовов).
+    /// Полный конструктор: дополнительно принимает опции журналирования.
     pub fn with_options(
         downstreams: HashMap<String, DownstreamService>,
         policy: Arc<RwLock<PolicyEngine>>,
         log: Option<LogHandle>,
         call_timeout: Duration,
         list_timeout: Duration,
-        passthrough: bool,
-        log_args: bool,
+        options: GatewayOptions,
     ) -> Self {
         let capabilities = merged_capabilities(&downstreams);
         Self {
@@ -199,8 +213,9 @@ impl Gateway {
             log,
             call_timeout,
             list_timeout,
-            passthrough,
-            log_args,
+            passthrough: options.passthrough,
+            log_args: options.log_args,
+            canon: options.canon,
             capabilities,
             resource_owners: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -301,7 +316,7 @@ impl Gateway {
         log.write(CallRecord {
             ts: now_rfc3339(),
             id: next_event_id(),
-            canonical_subset: canonical_subset(&server, &tool, args),
+            canonical_subset: self.canon.subset(&server, &tool, args),
             server,
             tool,
             name_sanitized: server_dirty || tool_dirty,

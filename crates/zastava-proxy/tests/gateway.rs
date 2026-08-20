@@ -10,7 +10,7 @@ use rmcp::model::{CallToolRequestParams, CallToolResult, ContentBlock};
 use rmcp::ServiceExt;
 use zastava_core::{Config, PolicyEngine};
 use zastava_proxy::fixture::{EchoFixture, EndlessPagingFixture, HangingFixture, RichFixture};
-use zastava_proxy::gateway::{DownstreamService, Gateway};
+use zastava_proxy::gateway::{DownstreamService, Gateway, GatewayOptions};
 use zastava_proxy::logger;
 
 /// Поднимает in-process фикстуру и возвращает клиентский сервис к ней.
@@ -48,6 +48,42 @@ async fn gateway_with(policy_toml: &str, call_timeout_ms: u64, passthrough: bool
         Duration::from_millis(call_timeout_ms),
         Duration::from_millis(2_000),
         passthrough,
+    );
+
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        if let Ok(running) = gateway.serve(server_io).await {
+            let _ = running.waiting().await;
+        }
+    });
+    let client = ().serve(client_io).await.expect("gateway client");
+    TestGateway {
+        client,
+        log_path,
+        _log_dir: log_dir,
+    }
+}
+
+/// Как `gateway_with`, но с включённой канонизацией аргументов (M3).
+async fn gateway_with_canon(config_toml: &str) -> TestGateway {
+    let config = Config::from_toml_str(config_toml).expect("test config");
+    let mut downstreams = HashMap::new();
+    downstreams.insert("alpha".to_string(), fixture_downstream("alpha").await);
+
+    let log_dir = tempfile::tempdir().expect("tempdir");
+    let log_path = log_dir.path().join("calls.jsonl");
+    let log = logger::start(log_path.clone(), logger::DEFAULT_MAX_LOG_BYTES);
+
+    let gateway = Gateway::with_options(
+        downstreams,
+        Arc::new(RwLock::new(PolicyEngine::from_config(&config.policy))),
+        Some(log),
+        Duration::from_millis(5_000),
+        Duration::from_millis(2_000),
+        GatewayOptions {
+            canon: zastava_core::CanonRules::from_config(&config.canon),
+            ..GatewayOptions::default()
+        },
     );
 
     let (client_io, server_io) = tokio::io::duplex(64 * 1024);
@@ -582,4 +618,138 @@ async fn policy_reload_picks_up_new_rules_without_restart() {
         }
     }
     assert!(passed, "reload не подхватил allow-правило за 5с");
+}
+
+const ENFORCE_PATH_PREFIX: &str = r#"
+[servers.alpha]
+command = "unused-in-tests"
+[policy]
+mode = "enforce"
+default = "deny"
+[[policy.allow]]
+sig = "alpha__write_file"
+args = { path = { prefix = "C:/work/zastava" } }
+"#;
+
+#[tokio::test]
+async fn argument_rule_narrows_a_tool_through_the_proxy() {
+    // Ради этого проект и существует: клиентский permissions.allow умеет
+    // только «инструмент можно или нельзя», а здесь один и тот же инструмент
+    // разрешён для одного пути и запрещён для другого.
+    let gw = gateway_with_canon(ENFORCE_PATH_PREFIX).await;
+
+    let inside = gw
+        .client
+        .call_tool(call(
+            "alpha__write_file",
+            serde_json::json!({"path": r"C:\work\zastava\notes.md", "content": "ok"}),
+        ))
+        .await
+        .expect("разрешённый путь обязан пройти");
+    assert!(text_of(&inside).contains("wrote"), "{:?}", inside);
+
+    // Отказ приходит как tool-level ошибка (модель должна его прочитать и
+    // понять), а не как протокольная — иначе клиент отрендерит её непрозрачно.
+    let outside = gw
+        .client
+        .call_tool(call(
+            "alpha__write_file",
+            serde_json::json!({"path": "C:/Users/alice/.ssh/id_ed25519", "content": "pwned"}),
+        ))
+        .await
+        .expect("отказ политики — это результат, а не обрыв протокола");
+    assert_eq!(outside.is_error, Some(true), "{outside:?}");
+    assert!(
+        text_of(&outside).contains("zastava policy"),
+        "{:?}",
+        text_of(&outside)
+    );
+    assert!(
+        !text_of(&outside).contains("wrote"),
+        "downstream не должен был получить вызов: {:?}",
+        text_of(&outside)
+    );
+
+    // Оба вызова обязаны быть в аудите — и разрешённый, и отклонённый.
+    let records = wait_records(&gw.log_path, 2).await;
+    let decisions: Vec<&str> = records
+        .iter()
+        .filter(|r| r.is_call())
+        .map(|r| r.decision.as_str())
+        .collect();
+    assert!(decisions.contains(&"allow"), "{decisions:?}");
+    assert!(decisions.contains(&"deny"), "{decisions:?}");
+}
+
+#[tokio::test]
+async fn journal_feeds_learn_which_produces_a_rule_that_enforces() {
+    // Полный круг продукта: наблюдение → черновик правила → реальное сужение.
+    // Каждое звено проверено по отдельности, но ценность даёт именно круг.
+    let observe = r#"
+[servers.alpha]
+command = "unused-in-tests"
+[policy]
+mode = "warn"
+"#;
+    let gw = gateway_with_canon(observe).await;
+    for _ in 0..2 {
+        gw.client
+            .call_tool(call(
+                "alpha__write_file",
+                serde_json::json!({
+                    "path": "C:/work/zastava/crates/core/src/lib.rs",
+                    "content": "секретное содержимое файла"
+                }),
+            ))
+            .await
+            .expect("warn-режим не блокирует");
+    }
+    let records = wait_records(&gw.log_path, 2).await;
+
+    // 1. В журнале лежит граница, а не данные.
+    let call_record = records.iter().find(|r| r.is_call()).expect("call record");
+    assert_eq!(
+        call_record.canonical_subset.get("path").map(String::as_str),
+        Some("C:/work/zastava/…"),
+        "{:?}",
+        call_record.canonical_subset
+    );
+    assert!(
+        !call_record.canonical_subset.contains_key("content"),
+        "содержимое файла не должно попадать в журнал: {:?}",
+        call_record.canonical_subset
+    );
+
+    // 2. learn превращает наблюдение в аргументное правило.
+    let config = Config::from_toml_str(observe).expect("config");
+    let learned = zastava_core::learn::suggest(&records, &config);
+    let proposal = learned
+        .proposals
+        .iter()
+        .find(|p| p.sig == "alpha__write_file")
+        .expect("правило для наблюдённого инструмента");
+    assert!(
+        proposal.is_narrowed(),
+        "learn обязан сузить по пути: {proposal:?}"
+    );
+
+    // 3. Сгенерированное правило реально работает на сыром аргументе.
+    let enforced = format!(
+        "[servers.alpha]
+command = \"unused-in-tests\"
+[policy]
+mode = \"enforce\"
+{}",
+        learned.toml_snippet
+    );
+    let parsed = Config::from_toml_str(&enforced).expect("сниппет обязан быть валидным конфигом");
+    let engine = PolicyEngine::from_config(&parsed.policy);
+    let inside = serde_json::json!({"path": r"C:\work\zastava\other.rs"});
+    let outside = serde_json::json!({"path": "C:/Users/alice/.ssh/id"});
+    assert!(!engine
+        .decide("alpha", "write_file", inside.as_object().unwrap())
+        .blocks());
+    assert!(engine
+        .decide("alpha", "write_file", outside.as_object().unwrap())
+        .blocks());
 }

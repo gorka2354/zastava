@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod canon;
 pub mod config;
 pub mod error;
 pub mod learn;
@@ -15,6 +16,7 @@ pub mod record;
 pub mod signature;
 pub mod stats;
 
+pub use canon::CanonRules;
 pub use config::Config;
 pub use error::ConfigError;
 pub use policy::{Decision, PolicyEngine, Verdict};

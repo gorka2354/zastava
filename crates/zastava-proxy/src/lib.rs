@@ -115,8 +115,11 @@ pub async fn run(config: Config, options: RunOptions) -> Result<(), ProxyError> 
         log,
         call_timeout,
         list_timeout,
-        options.passthrough,
-        config.log.log_args,
+        gateway::GatewayOptions {
+            passthrough: options.passthrough,
+            log_args: config.log.log_args,
+            canon: zastava_core::CanonRules::from_config(&config.canon),
+        },
     );
     let service = gateway
         .serve(rmcp::transport::stdio())

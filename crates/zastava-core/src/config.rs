@@ -1,14 +1,14 @@
 //! Модель `zastava.toml`.
 //!
-//! Формат с первого дня рассчитан на аргументные матчеры (M3): правило несёт
-//! текстовую сигнатуру `<server>__<tool>` / `<server>__*` и опциональную
-//! таблицу `args` (в v0 парсится и валидируется, семантика включается в M3).
+//! Правило несёт текстовую сигнатуру `<server>__<tool>` / `<server>__*` и
+//! опциональную таблицу `args` с матчерами на значения аргументов (M3).
 //! Разделитель неймспейса — `__`, поэтому имена серверов не могут его
 //! содержать (иначе сигнатуры становятся неоднозначными).
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::error::ConfigError;
 
@@ -33,6 +33,39 @@ pub struct Config {
     /// Настройки самого гейтвея (таймауты).
     #[serde(default)]
     pub proxy: ProxyConfig,
+    /// Правила канонизации аргументов для журнала.
+    #[serde(default)]
+    pub canon: CanonConfig,
+}
+
+/// Секция `[canon]` — что из аргументов попадает в журнал открыто.
+///
+/// Дефолт (whitelist ключей-идентификаторов) живёт в модуле `canon`; здесь
+/// только пользовательские поправки к нему.
+#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanonConfig {
+    /// Дополнительные ключи сверх дефолтного whitelist.
+    #[serde(default)]
+    pub extra_keys: Vec<String>,
+    /// Ключи, которые не писать никогда, даже если они в whitelist.
+    #[serde(default)]
+    pub deny_keys: Vec<String>,
+    /// Точечные правила на инструмент: `[[canon.rules]]`.
+    #[serde(default)]
+    pub rules: Vec<CanonRuleConfig>,
+}
+
+/// Одно правило канонизации для конкретного инструмента.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanonRuleConfig {
+    /// Сигнатура инструмента: `<server>__<tool>` (без `*`).
+    pub sig: String,
+    /// Ключи аргументов, попадающие в сигнатуру. Заменяют общий whitelist
+    /// целиком, а не дополняют его: точечное правило — это заявление
+    /// «для этого инструмента ресурс определяют ровно эти ключи».
+    pub keys: Vec<String>,
 }
 
 /// Секция `[proxy]`.
@@ -139,10 +172,122 @@ pub struct PolicyConfig {
 pub struct RuleConfig {
     /// Сигнатура: `<server>__<tool>` или `<server>__*`.
     pub sig: String,
-    /// Аргументные матчеры (M3): ключ аргумента → точное значение.
-    /// В v0 валидируются синтаксически, семантика — warn-заглушка.
+    /// Аргументные матчеры: ключ аргумента → условие на его значение.
+    ///
+    /// Матчеры применяются к СЫРЫМ аргументам вызова, а не к канонизованному
+    /// поднабору из журнала: префикс пути должен значить именно путь, а не
+    /// его усечённую для лога версию. Мост между журналом и правилами —
+    /// `zastava learn`, который переводит наблюдения в матчеры.
     #[serde(default)]
-    pub args: Option<BTreeMap<String, String>>,
+    pub args: Option<BTreeMap<String, ArgMatcher>>,
+    /// Требовать, чтобы в вызове не было аргументов сверх перечисленных.
+    ///
+    /// По умолчанию правило ограничивает только названные ключи, а прочие
+    /// свободны — этого хватает, когда ресурс определяет один ключ (`repo`).
+    /// Там, где на ресурс может указывать несколько разных ключей
+    /// (`path` и `paths`), опция закрывает обход через непокрытый ключ.
+    #[serde(default)]
+    pub deny_extra_args: bool,
+}
+
+/// Условие на значение одного аргумента.
+///
+/// В TOML пишется либо строкой (точное совпадение), либо таблицей:
+/// ```toml
+/// args = { repo = "gorka2354/zastava" }              # точное
+/// args = { path = { prefix = "C:/work/zastava" } }   # префикс
+/// args = { repo = { any_of = ["a/b", "c/d"] } }      # список
+/// ```
+/// Регулярных выражений здесь нет намеренно: политика безопасности должна
+/// читаться однозначно с первого взгляда, а regex приносит и ReDoS, и споры
+/// о том, что именно матчится.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum ArgMatcher {
+    /// Точное совпадение строки.
+    Exact(String),
+    /// Совпадение по префиксу.
+    Prefix(PrefixMatcher),
+    /// Совпадение с любым значением из списка.
+    AnyOf(AnyOfMatcher),
+}
+
+/// Приведение значения для префиксного сравнения.
+///
+/// Префикс существует ради файловых и URL-границ, а там и `\` против `/`, и
+/// регистр — различия, которых сама ОС не делает: на Windows `C:\Work` и
+/// `c:/work` — одно место. Байтовое сравнение дало бы правило, которое либо
+/// молча никогда не совпадает (`learn` видит в журнале нормализованный путь),
+/// либо обходится сменой регистра. Приведение одинаково на всех платформах —
+/// политика обязана значить одно и то же на любой машине.
+///
+/// Точные матчеры (`exact`, `any_of`) остаются побайтовыми.
+fn fold_for_prefix(value: &str) -> String {
+    value.replace('\\', "/").to_lowercase()
+}
+
+/// `{ prefix = "..." }`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrefixMatcher {
+    /// Требуемый префикс значения.
+    pub prefix: String,
+}
+
+/// `{ any_of = [...] }`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AnyOfMatcher {
+    /// Допустимые значения.
+    pub any_of: Vec<String>,
+}
+
+impl ArgMatcher {
+    /// Совпадает ли матчер с сырым значением аргумента.
+    ///
+    /// Не-строки не совпадают ни с чем: политика рассуждает о строковых
+    /// идентификаторах, и «число 5 похоже на строку "5"» — ровно тот сорт
+    /// догадки, из-за которого гейт можно обойти.
+    pub fn matches(&self, value: &Value) -> bool {
+        let Value::String(actual) = value else {
+            return false;
+        };
+        match self {
+            ArgMatcher::Exact(expected) => actual == expected,
+            ArgMatcher::Prefix(m) => {
+                fold_for_prefix(actual).starts_with(&fold_for_prefix(&m.prefix))
+            }
+            ArgMatcher::AnyOf(m) => m.any_of.iter().any(|candidate| candidate == actual),
+        }
+    }
+
+    /// Проблемы матчера для доменной валидации (пустые значения и т.п.).
+    fn problems(&self) -> Vec<&'static str> {
+        let mut problems = Vec::new();
+        match self {
+            ArgMatcher::Exact(value) => {
+                if value.is_empty() {
+                    problems.push("empty exact value");
+                }
+            }
+            ArgMatcher::Prefix(m) => {
+                if m.prefix.is_empty() {
+                    // Пустой префикс совпадает с чем угодно: это не сужение,
+                    // а бесшумное «разрешить всё» с видом ограничения.
+                    problems.push("empty prefix matches any value");
+                }
+            }
+            ArgMatcher::AnyOf(m) => {
+                if m.any_of.is_empty() {
+                    problems.push("empty any_of matches nothing");
+                }
+                if m.any_of.iter().any(String::is_empty) {
+                    problems.push("empty value in any_of");
+                }
+            }
+        }
+        problems
+    }
 }
 
 /// Секция `[log]`.
@@ -230,24 +375,59 @@ impl Config {
                                 rule.sig
                             ));
                         }
-                        for (key, value) in args {
+                        for (key, matcher) in args {
                             if key.is_empty() {
-                                problems
-                                    .push(format!("rule '{}': empty args key", rule.sig));
+                                problems.push(format!("rule '{}': empty args key", rule.sig));
                             }
-                            if value.is_empty() {
+                            for problem in matcher.problems() {
                                 problems.push(format!(
-                                    "rule '{}': args['{key}'] is empty",
+                                    "rule '{}': args['{key}']: {problem}",
                                     rule.sig
                                 ));
                             }
                         }
+                    }
+                    // `deny_extra_args` без матчеров означает «вызов вообще без
+                    // аргументов» — почти всегда это забытая таблица args, а не
+                    // намерение, и молча запрещать все вызовы инструмента мы
+                    // не станем.
+                    if rule.deny_extra_args && rule.args.is_none() {
+                        problems.push(format!(
+                            "rule '{}': deny_extra_args requires an args table",
+                            rule.sig
+                        ));
                     }
                 }
                 None => problems.push(format!(
                     "rule '{}' is malformed: expected '<server>{NS_SEP}<tool>' or '<server>{NS_SEP}*'",
                     rule.sig
                 )),
+            }
+        }
+
+        for rule in &self.canon.rules {
+            match parse_sig(&rule.sig) {
+                Some(sig) => {
+                    if sig.tool == "*" {
+                        problems.push(format!(
+                            "canon rule '{}': a concrete tool is required, not '*'",
+                            rule.sig
+                        ));
+                    }
+                    if !self.servers.contains_key(sig.server) {
+                        problems.push(format!(
+                            "canon rule '{}' references unknown server '{}'",
+                            rule.sig, sig.server
+                        ));
+                    }
+                }
+                None => problems.push(format!(
+                    "canon rule '{}' is malformed: expected '<server>{NS_SEP}<tool>'",
+                    rule.sig
+                )),
+            }
+            if rule.keys.iter().any(String::is_empty) {
+                problems.push(format!("canon rule '{}': empty key", rule.sig));
             }
         }
 
@@ -373,7 +553,10 @@ log_args = false
         assert_eq!(config.policy.default, DefaultAction::Deny);
         assert_eq!(config.policy.allow.len(), 2);
         let rule = &config.policy.allow[1];
-        assert_eq!(rule.args.as_ref().unwrap()["repo"], "gorka2354/zastava");
+        assert_eq!(
+            rule.args.as_ref().unwrap()["repo"],
+            ArgMatcher::Exact("gorka2354/zastava".into())
+        );
         assert!(!config.log.log_args);
     }
 

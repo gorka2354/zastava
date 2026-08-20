@@ -32,6 +32,16 @@ struct SlowParams {
     ms: u64,
 }
 
+/// Аргументы `write_file`: путь-идентификатор ресурса плюс содержимое,
+/// которое в журнал попадать НЕ должно.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct WriteParams {
+    /// Куда пишем.
+    path: String,
+    /// Что пишем.
+    content: String,
+}
+
 #[tool_router]
 impl EchoFixture {
     /// Создаёт фикстуру с именем.
@@ -45,6 +55,14 @@ impl EchoFixture {
     #[tool(description = "Echo back a message")]
     async fn ping(&self, Parameters(PingParams { message }): Parameters<PingParams>) -> String {
         format!("[{}] pong: {message}", self.name)
+    }
+
+    #[tool(description = "Pretend to write a file at path")]
+    async fn write_file(
+        &self,
+        Parameters(WriteParams { path, content }): Parameters<WriteParams>,
+    ) -> String {
+        format!("[{}] wrote {} bytes to {path}", self.name, content.len())
     }
 
     #[tool(description = "Echo after sleeping for ms milliseconds")]

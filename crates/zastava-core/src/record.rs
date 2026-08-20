@@ -18,6 +18,11 @@ fn default_kind() -> String {
 }
 
 /// Одна запись журнала.
+///
+/// Все поля, кроме `ts`/`id`/`server`/`tool`, читаются с `serde(default)`.
+/// Журнал — формат ДЛИТЕЛЬНОГО хранения: запись, сделанная прошлой версией
+/// заставы, обязана остаться читаемой после добавления полей, иначе
+/// обновление бинаря молча стирает часть истории из всех отчётов.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CallRecord {
     /// Вид записи: `call` (вызов инструмента) или `marker` (событие гейтвея:
@@ -34,10 +39,13 @@ pub struct CallRecord {
     /// Инструмент (без префикса сервера).
     pub tool: String,
     /// Канонический поднабор аргументов (открыто; см. signature.rs).
+    #[serde(default)]
     pub canonical_subset: BTreeMap<String, String>,
     /// Версия правил канонизации на момент записи.
+    #[serde(default)]
     pub canon_version: u32,
     /// SHA-256 полных аргументов.
+    #[serde(default)]
     pub args_hash: String,
     /// Полные аргументы вызова — ТОЛЬКО при `log.log_args = true`.
     /// Осознанный опт-ин: до маскировки секретов (M4) сюда попадёт всё, что
@@ -45,17 +53,22 @@ pub struct CallRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub args: Option<serde_json::Value>,
     /// Вердикт политики: "allow" | "deny".
+    #[serde(default)]
     pub decision: String,
     /// Был ли вердикт применён фактически (enforce) или только залогирован (warn).
+    #[serde(default)]
     pub enforced: bool,
     /// Сработавшее правило, если было.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub matched_rule: Option<String>,
     /// Длительность downstream-вызова, мс (0, если вызов был заблокирован).
+    #[serde(default)]
     pub duration_ms: u64,
     /// Размер сериализованного результата, байт (0, если заблокирован/ошибка).
+    #[serde(default)]
     pub result_bytes: u64,
     /// Завершился ли вызов ошибкой (включая таймаут downstream).
+    #[serde(default)]
     pub is_error: bool,
     /// Имя сервера/инструмента содержало символы вне whitelist и записано
     /// экранированным. Факт попытки обязан быть виден при чтении журнала.
