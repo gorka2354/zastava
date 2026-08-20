@@ -471,3 +471,137 @@ fn allow_appends_rule_and_check_sees_it() {
         .unwrap();
     assert!(!bad.status.success());
 }
+
+/// Убивает процесс по pid. Нужен, чтобы смоделировать downstream, умерший
+/// ПОСРЕДИ запроса — самый неприятный для аудита случай.
+fn kill_pid(pid: u32) {
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/F"])
+            .output();
+    }
+    #[cfg(unix)]
+    {
+        let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+    }
+}
+
+#[test]
+fn downstream_death_mid_request_is_audited_as_abandoned_not_failed() {
+    // Запрос УЖЕ ушёл вниз, когда процесс умер: побочный эффект мог
+    // состояться. До M2-full такой случай подставлял чужую ошибку и уезжал в
+    // журнал как `failed: Unexpected response type` — то есть аудит утверждал,
+    // что вызова не было, хотя он мог случиться.
+    let dir = tempfile::tempdir().unwrap();
+    let pid_file = dir.path().join("child.pid");
+    let log_path = dir.path().join("audit.jsonl");
+    let policy = format!("[log]\npath = {:?}\n", log_path.to_string_lossy());
+    let config = write_config(&dir, &policy, Some(&pid_file));
+    let mut z = start_run(&config, &[]);
+
+    z.send(INIT);
+    let _ = z.read_line();
+    z.send(INITIALIZED);
+    z.send(LIST);
+    let _ = z.read_line();
+
+    let mut child_pid = None;
+    for _ in 0..100 {
+        if let Ok(content) = std::fs::read_to_string(&pid_file) {
+            if let Ok(pid) = content.trim().parse::<u32>() {
+                child_pid = Some(pid);
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let child_pid = child_pid.expect("фикстура должна записать свой pid");
+
+    // Долгий вызов, который заведомо не успеет ответить.
+    z.send(
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"alpha__slow_ping","arguments":{"ms":30000}}}"#,
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    kill_pid(child_pid);
+
+    // read_line блокируется, пока ответ не придёт: если гейтвей зависнет,
+    // тест упрётся в общий таймаут, а не пройдёт молча.
+    let answer = z.read_line();
+    assert!(
+        answer.contains("may still have taken effect"),
+        "ответ обязан признать, что вызов мог состояться: {answer}"
+    );
+    assert!(
+        !answer.contains("Unexpected response"),
+        "чужая ошибка-затычка вместо честной причины: {answer}"
+    );
+
+    z.close_stdin();
+    let _ = z.child.wait();
+
+    let content = std::fs::read_to_string(&log_path).expect("журнал");
+    let record = content
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|r| r["tool"] == "slow_ping")
+        .expect("вызов обязан быть в аудите");
+    assert_eq!(
+        record["abandoned"], true,
+        "аудит обязан пометить вызов как брошенный, а не как несостоявшийся: {record}"
+    );
+}
+
+#[test]
+fn the_audit_records_which_downstream_came_up_and_which_did_not() {
+    // Версии протокола у клиента и у downstream'а могут РАЗОЙТИСЬ, и на этом
+    // проект уже дважды ловил реальные баги (resultType, ttlMs). При разборе
+    // инцидента первым делом спрашивают, какие версии там были — значит это
+    // факт аудита, а не строчка в stderr.
+    //
+    // Упавший сервер тоже событие: без записи его инструменты просто молча
+    // исчезают из выдачи, и человек видит «инструмента нет», а не «сервер не
+    // поднялся».
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("audit.jsonl");
+    let policy = format!(
+        "[servers.dead]\ncommand = \"no-such-binary-anywhere\"\n\n[log]\npath = {:?}\n",
+        log_path.to_string_lossy()
+    );
+    let config = write_config(&dir, &policy, None);
+    let mut z = start_run(&config, &[]);
+
+    z.send(INIT);
+    let _ = z.read_line();
+    z.send(INITIALIZED);
+    z.close_stdin();
+    let _ = z.child.wait();
+
+    let content = std::fs::read_to_string(&log_path).expect("журнал");
+    let markers: Vec<(String, String)> = content
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .map(|r| {
+            (
+                r["tool"].as_str().unwrap_or_default().to_string(),
+                r["matched_rule"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect();
+
+    let up = markers
+        .iter()
+        .find(|(tool, _)| tool == "downstream_up")
+        .expect("поднявшийся сервер обязан быть в аудите");
+    assert!(up.1.contains("alpha"), "{up:?}");
+    assert!(
+        up.1.contains("protocol 20"),
+        "версия протокола обязана быть записана: {up:?}"
+    );
+
+    let failed = markers
+        .iter()
+        .find(|(tool, _)| tool == "downstream_failed")
+        .expect("упавший сервер обязан быть в аудите");
+    assert!(failed.1.contains("dead"), "{failed:?}");
+}

@@ -94,9 +94,49 @@ pub async fn run(config: Config, options: RunOptions) -> Result<(), ProxyError> 
         let Ok((name, result)) = joined else { continue };
         match result {
             Ok(downstream) => {
+                // С кем именно мы соединились — факт для аудита, а не деталь.
+                // Клиент и downstream могут договориться о РАЗНЫХ ревизиях
+                // протокола, и это уже дважды рождало реальные баги (спайк:
+                // resultType и ttlMs). При разборе инцидента первым делом
+                // спрашивают «а какие версии там были».
+                if let Some(log) = &log {
+                    let info = downstream.service.peer_info();
+                    let detail = match info {
+                        Some(info) => {
+                            let (server, version) = match &info.server_info {
+                                Some(impl_) => (impl_.name.as_str(), impl_.version.as_str()),
+                                None => ("<unnamed>", "<unknown>"),
+                            };
+                            format!(
+                                "{name}: {server} {version} (protocol {})",
+                                info.protocol_version
+                            )
+                        }
+                        None => format!("{name}: peer info unavailable"),
+                    };
+                    log.write(zastava_core::CallRecord::marker(
+                        util::now_rfc3339(),
+                        util::next_event_id(),
+                        "downstream_up",
+                        Some(detail),
+                    ));
+                }
                 downstreams.insert(name, downstream.service);
             }
-            Err(e) => tracing::error!(server = %name, error = %e, "downstream failed to start"),
+            Err(e) => {
+                // Упавший downstream — тоже событие аудита: иначе его
+                // инструменты просто молча исчезают из выдачи, и человек
+                // видит «инструмента нет», а не «сервер не поднялся».
+                if let Some(log) = &log {
+                    log.write(zastava_core::CallRecord::marker(
+                        util::now_rfc3339(),
+                        util::next_event_id(),
+                        "downstream_failed",
+                        Some(format!("{name}: {e}")),
+                    ));
+                }
+                tracing::error!(server = %name, error = %e, "downstream failed to start");
+            }
         }
     }
     if downstreams.is_empty() {
