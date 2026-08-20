@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod downstream;
 pub mod error;
 pub mod fixture;
 pub mod gateway;
@@ -44,11 +45,18 @@ pub async fn run(config: Config, options: RunOptions) -> Result<(), ProxyError> 
     let call_timeout = Duration::from_millis(config.proxy.call_timeout_ms);
     let list_timeout = Duration::from_millis(config.proxy.list_timeout_ms);
 
+    // Слот заводится ДО спавна: downstream'ы получают его пустым и ждут,
+    // пока подключится настоящий клиент. Иначе никак — `Peer<RoleServer>`
+    // рождается только в момент `serve`, то есть заведомо позже.
+    let upstream = downstream::UpstreamSlot::new();
+
     // Eager parallel spawn (T6.4): опоздавшие/упавшие не валят остальных.
     let mut join_set = tokio::task::JoinSet::new();
     for (name, server_config) in config.servers.clone() {
+        let slot = upstream.clone();
         join_set.spawn(async move {
-            let result = spawn::spawn_downstream(&name, &server_config, initialize_timeout).await;
+            let result =
+                spawn::spawn_downstream(&name, &server_config, initialize_timeout, slot).await;
             (name, result)
         });
     }
@@ -137,6 +145,9 @@ pub async fn run(config: Config, options: RunOptions) -> Result<(), ProxyError> 
         .map_err(|e| ProxyError::Serve {
             message: e.to_string(),
         })?;
+    // Теперь клиент есть — отдаём его пир downstream'ам, чтобы им было куда
+    // адресовать обратные запросы и уведомления.
+    upstream.set(service.peer().clone());
     tracing::info!(
         passthrough = options.passthrough,
         "zastava serving on stdio"

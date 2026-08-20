@@ -65,6 +65,18 @@ impl EchoFixture {
         format!("[{}] wrote {} bytes to {path}", self.name, content.len())
     }
 
+    #[tool(description = "Ask the connected client for its root directories")]
+    #[allow(deprecated)] // roots устарели по SEP-2577; фикстуре они нужны как проба
+    async fn ask_roots(&self, peer: rmcp::Peer<rmcp::service::RoleServer>) -> String {
+        // Инструмент существует ради проверки ОБРАТНОГО направления: сервер
+        // спрашивает своего клиента (то есть заставу). До M2-full застава
+        // отвечала выдуманным `Ok(пустой список)` от имени пользователя.
+        match peer.list_roots().await {
+            Ok(result) => format!("ok: {} roots", result.roots.len()),
+            Err(e) => format!("err: {e}"),
+        }
+    }
+
     #[tool(description = "Echo after sleeping for ms milliseconds")]
     async fn slow_ping(&self, Parameters(SlowParams { ms }): Parameters<SlowParams>) -> String {
         tokio::time::sleep(std::time::Duration::from_millis(ms)).await;

@@ -9,6 +9,7 @@ use std::time::Duration;
 use rmcp::model::{CallToolRequestParams, CallToolResult, ContentBlock};
 use rmcp::ServiceExt;
 use zastava_core::{Config, PolicyEngine};
+use zastava_proxy::downstream::{DownstreamHandler, UpstreamSlot};
 use zastava_proxy::fixture::{EchoFixture, EndlessPagingFixture, HangingFixture, RichFixture};
 use zastava_proxy::gateway::{DownstreamService, Gateway, GatewayOptions};
 use zastava_proxy::logger;
@@ -22,7 +23,12 @@ async fn fixture_downstream(name: &str) -> DownstreamService {
             let _ = running.waiting().await;
         }
     });
-    ().serve(client_io).await.expect("fixture client")
+    // Клиент-роль теперь настоящий обработчик, а не юнит-тип: тесты
+    // обязаны ходить тем же путём, что и боевой код.
+    DownstreamHandler::new("test", UpstreamSlot::new())
+        .serve(client_io)
+        .await
+        .expect("fixture client")
 }
 
 struct TestGateway {
@@ -295,7 +301,12 @@ where
             let _ = running.waiting().await;
         }
     });
-    ().serve(client_io).await.expect("fixture client")
+    // Клиент-роль теперь настоящий обработчик, а не юнит-тип: тесты
+    // обязаны ходить тем же путём, что и боевой код.
+    DownstreamHandler::new("test", UpstreamSlot::new())
+        .serve(client_io)
+        .await
+        .expect("fixture client")
 }
 
 /// Собирает гейтвей поверх готового набора downstream'ов.
@@ -512,7 +523,10 @@ async fn hung_downstream_does_not_block_tool_listing_of_others() {
             let _ = running.waiting().await;
         }
     });
-    let hung = ().serve(client_io).await.expect("hung client");
+    let hung = DownstreamHandler::new("hung", UpstreamSlot::new())
+        .serve(client_io)
+        .await
+        .expect("hung client");
 
     let mut downstreams = HashMap::new();
     downstreams.insert("alpha".to_string(), fixture_downstream("alpha").await);
@@ -896,5 +910,33 @@ async fn downstream_error_codes_survive_the_proxy() {
     assert!(
         text.contains("deleted"),
         "сообщение downstream'а должно дойти до клиента: {text}"
+    );
+}
+
+#[tokio::test]
+async fn zastava_refuses_reverse_requests_instead_of_answering_for_the_user() {
+    // До M2-full клиент-роль была юнит-типом `()`, а дефолты rmcp УСПЕШНЫ:
+    // на roots/list уходило Ok(пустой список), на elicitation — Ok(Decline).
+    // То есть застава отвечала downstream'у ОТ ИМЕНИ пользователя, ничего у
+    // него не спросив, и сервер не мог отличить это от решения человека.
+    let gw = gateway_with(WARN_NO_RULES, 5_000, false).await;
+    let result = gw
+        .client
+        .call_tool(call("alpha__ask_roots", serde_json::json!({})))
+        .await
+        .expect("вызов доходит до downstream'а");
+
+    let text = text_of(&result);
+    assert!(
+        !text.contains("ok: 0 roots"),
+        "нельзя отвечать «у пользователя нет корней» вместо него: {text}"
+    );
+    assert!(
+        text.starts_with("err:"),
+        "downstream обязан получить честный отказ: {text}"
+    );
+    assert!(
+        text.contains("does not forward") || text.contains("roots/list"),
+        "отказ должен объяснять причину: {text}"
     );
 }

@@ -21,6 +21,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use zastava_core::config::ServerConfig;
 
+use crate::downstream::{DownstreamHandler, UpstreamSlot};
 use crate::error::ProxyError;
 
 /// Живое подключение к downstream-серверу. Уборка дерева процессов зашита в
@@ -29,7 +30,7 @@ pub struct Downstream {
     /// Имя сервера из конфига (ключ неймспейса).
     pub name: String,
     /// rmcp-клиент к процессу.
-    pub service: RunningService<RoleClient, ()>,
+    pub service: RunningService<RoleClient, DownstreamHandler>,
 }
 
 /// Запускает downstream и проводит initialize-хендшейк с таймаутом.
@@ -37,11 +38,13 @@ pub async fn spawn_downstream(
     name: &str,
     config: &ServerConfig,
     initialize_timeout: Duration,
+    upstream: UpstreamSlot,
 ) -> Result<Downstream, ProxyError> {
     let (transport, stderr) = spawn_transport(name, config)?;
     drain_stderr(name, stderr);
 
-    let service = tokio::time::timeout(initialize_timeout, ().serve(transport))
+    let handler = DownstreamHandler::new(name, upstream);
+    let service = tokio::time::timeout(initialize_timeout, handler.serve(transport))
         .await
         .map_err(|_| ProxyError::InitializeTimeout {
             server: name.to_string(),

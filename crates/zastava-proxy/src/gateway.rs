@@ -41,7 +41,7 @@ use crate::logger::LogHandle;
 use crate::util::{next_event_id, now_rfc3339};
 
 /// Подключённый downstream (клиентская сторона rmcp).
-pub type DownstreamService = RunningService<RoleClient, ()>;
+pub type DownstreamService = RunningService<RoleClient, crate::downstream::DownstreamHandler>;
 
 /// Итог форварда для записи в журнал.
 struct CallOutcome {
