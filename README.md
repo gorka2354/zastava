@@ -1,6 +1,7 @@
 # zastava
 
 [![CI](https://github.com/gorka2354/zastava/actions/workflows/ci.yml/badge.svg)](https://github.com/gorka2354/zastava/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/zastava.svg)](https://crates.io/crates/zastava)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![MSRV 1.85](https://img.shields.io/badge/MSRV-1.85-orange.svg)
 
@@ -93,6 +94,7 @@ URL — до схемы и хоста, и с отказом от значени�
 - [x] M3: аргументные матчеры (`exact` / `prefix` / `any_of`, `deny_extra_args`),
       канонизация журнала, `learn` с аргументными правилами, `annotate`,
       аудит ослабления политики на reload
+- [x] Имя `zastava` закреплено на crates.io (заглушка 0.0.0; рабочий релиз — 0.1.0 на M4)
 - [ ] M2-full (conformance) → M4 (release)
 
 ## Лицензия
