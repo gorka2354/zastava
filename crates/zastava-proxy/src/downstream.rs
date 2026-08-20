@@ -23,8 +23,8 @@
 #![allow(deprecated)]
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use rmcp::handler::client::ClientHandler;
 use rmcp::model::{
@@ -33,6 +33,10 @@ use rmcp::model::{
 };
 use rmcp::service::{NotificationContext, Peer, RequestContext, RoleClient, RoleServer};
 use tokio::sync::watch;
+use zastava_core::CallRecord;
+
+use crate::logger::LogHandle;
+use crate::util::{next_event_id, now_rfc3339};
 
 /// Слот с пиром НАСТОЯЩЕГО клиента.
 ///
@@ -182,6 +186,157 @@ impl Drop for ProgressGuard {
     }
 }
 
+/// Пауза схлопывания уведомлений об изменении списков.
+const LIST_CHANGED_DEBOUNCE: Duration = Duration::from_millis(200);
+/// Не чаще одного исходящего уведомления на категорию за это окно.
+const LIST_CHANGED_MIN_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Какой список изменился.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ListKind {
+    /// Инструменты.
+    Tools,
+    /// Ресурсы.
+    Resources,
+    /// Промпты.
+    Prompts,
+}
+
+impl ListKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            ListKind::Tools => "tools",
+            ListKind::Resources => "resources",
+            ListKind::Prompts => "prompts",
+        }
+    }
+}
+
+/// Пересылка уведомлений «список изменился» от downstream'ов клиенту.
+///
+/// Три обязанности, и каждая появилась не просто так:
+///
+/// 1. **Схлопывание.** Пять downstream'ов, разом сообщивших об изменении, — это
+///    пять уведомлений клиенту об одном и том же факте «список инструментов
+///    больше не тот». Наружу уходит одно на категорию.
+/// 2. **Потолок частоты.** Уведомление заставляет клиента перезапросить списки,
+///    а гейтвей — веерно опросить ВСЕ downstream'ы с пагинацией. Недоверенный
+///    сервер, шлющий их шквалом, иначе управляет нагрузкой всего гейтвея.
+///    Мы не отбрасываем сигнал, а откладываем — потерять изменение хуже.
+/// 3. **Чистка кеша владельцев ресурсов.** Ресурсы маршрутизируются по карте
+///    «URI → сервер», построенной на листинге. Если downstream переставил свои
+///    ресурсы, карта врёт и чтение уходит к бывшему владельцу.
+#[derive(Clone, Default)]
+pub struct ListChangedHub {
+    inner: Arc<HubInner>,
+}
+
+#[derive(Default)]
+struct HubInner {
+    upstream: UpstreamSlot,
+    /// Та же карта, что у гейтвея: её надо чистить при смене ресурсов.
+    resource_owners: Arc<RwLock<HashMap<String, String>>>,
+    log: Option<LogHandle>,
+    state: Mutex<HashMap<ListKind, CategoryState>>,
+}
+
+#[derive(Default)]
+struct CategoryState {
+    /// Уведомление уже запланировано — второе планировать не нужно.
+    scheduled: bool,
+    last_sent: Option<Instant>,
+}
+
+impl std::fmt::Debug for ListChangedHub {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ListChangedHub")
+    }
+}
+
+impl ListChangedHub {
+    /// Хаб, знающий, куда пересылать и какой кеш чистить.
+    pub fn new(
+        upstream: UpstreamSlot,
+        resource_owners: Arc<RwLock<HashMap<String, String>>>,
+        log: Option<LogHandle>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(HubInner {
+                upstream,
+                resource_owners,
+                log,
+                state: Mutex::new(HashMap::new()),
+            }),
+        }
+    }
+
+    /// Принимает уведомление от downstream'а `server`.
+    pub fn notify(&self, server: &str, kind: ListKind) {
+        // В аудит пишем КАЖДОЕ входящее с именем источника, даже если наружу
+        // уйдёт одно: расследование не должно терять, кто именно менялся.
+        if let Some(log) = &self.inner.log {
+            log.write(CallRecord::marker(
+                now_rfc3339(),
+                next_event_id(),
+                "list_changed",
+                Some(format!("{server}: {}", kind.as_str())),
+            ));
+        }
+
+        if kind == ListKind::Resources {
+            // Карта владельцев построена на прошлом листинге и теперь может
+            // врать: чтение ушло бы к бывшему владельцу ресурса.
+            self.inner
+                .resource_owners
+                .write()
+                .expect("resource owners lock poisoned")
+                .clear();
+        }
+
+        let delay = {
+            let mut state = self.inner.state.lock().expect("hub lock poisoned");
+            let entry = state.entry(kind).or_default();
+            if entry.scheduled {
+                return;
+            }
+            entry.scheduled = true;
+            // Пауза схлопывания плюс, если нужно, доводка до потолка частоты.
+            let since_last = entry
+                .last_sent
+                .map(|t| t.elapsed())
+                .unwrap_or(LIST_CHANGED_MIN_INTERVAL);
+            let cooldown = LIST_CHANGED_MIN_INTERVAL.saturating_sub(since_last);
+            LIST_CHANGED_DEBOUNCE.max(cooldown)
+        };
+
+        let inner = self.inner.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            {
+                let mut state = inner.state.lock().expect("hub lock poisoned");
+                let entry = state.entry(kind).or_default();
+                entry.scheduled = false;
+                entry.last_sent = Some(Instant::now());
+            }
+            // Уведомление — «выстрелил и забыл»: если клиента ещё нет, ждать
+            // ради него нечего, списки он и так запросит при подключении.
+            let Some(client) = inner.upstream.try_get() else {
+                return;
+            };
+            let sent = match kind {
+                ListKind::Tools => client.notify_tool_list_changed().await,
+                ListKind::Resources => client.notify_resource_list_changed().await,
+                ListKind::Prompts => client.notify_prompt_list_changed().await,
+            };
+            if let Err(e) = sent {
+                // Клиент вправе не принимать такие уведомления — это не наша
+                // авария.
+                tracing::debug!(kind = kind.as_str(), error = %e, "client did not accept list_changed");
+            }
+        });
+    }
+}
+
 /// Обработчик клиент-роли для одного downstream-сервера.
 #[derive(Clone)]
 pub struct DownstreamHandler {
@@ -192,6 +347,8 @@ pub struct DownstreamHandler {
     upstream: UpstreamSlot,
     /// Перевод progress-токенов между downstream'ом и клиентом.
     progress: ProgressBridge,
+    /// Пересылка уведомлений об изменении списков.
+    lists: ListChangedHub,
 }
 
 impl DownstreamHandler {
@@ -206,10 +363,21 @@ impl DownstreamHandler {
         upstream: UpstreamSlot,
         progress: ProgressBridge,
     ) -> Self {
+        Self::with_bridges(name, upstream, progress, ListChangedHub::default())
+    }
+
+    /// Полный конструктор: общие мост прогресса и хаб списков.
+    pub fn with_bridges(
+        name: impl Into<String>,
+        upstream: UpstreamSlot,
+        progress: ProgressBridge,
+        lists: ListChangedHub,
+    ) -> Self {
         Self {
             name: name.into(),
             upstream,
             progress,
+            lists,
         }
     }
 
@@ -273,11 +441,122 @@ impl ClientHandler for DownstreamHandler {
         // переводим токен и отправляем дальше.
         self.progress.relay(params).await;
     }
+
+    async fn on_tool_list_changed(&self, _context: NotificationContext<RoleClient>) {
+        self.lists.notify(&self.name, ListKind::Tools);
+    }
+
+    async fn on_resource_list_changed(&self, _context: NotificationContext<RoleClient>) {
+        self.lists.notify(&self.name, ListKind::Resources);
+    }
+
+    async fn on_prompt_list_changed(&self, _context: NotificationContext<RoleClient>) {
+        self.lists.notify(&self.name, ListKind::Prompts);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn owners_with(uri: &str, server: &str) -> Arc<RwLock<HashMap<String, String>>> {
+        let map = Arc::new(RwLock::new(HashMap::new()));
+        map.write()
+            .unwrap()
+            .insert(uri.to_string(), server.to_string());
+        map
+    }
+
+    #[tokio::test]
+    async fn resource_list_changed_drops_the_owner_cache() {
+        // Ресурсы маршрутизируются по карте «URI → сервер», построенной на
+        // прошлом листинге. Если downstream переставил свои ресурсы, карта
+        // врёт, и чтение уходит к БЫВШЕМУ владельцу.
+        let owners = owners_with("mem://note", "alpha");
+        let hub = ListChangedHub::new(UpstreamSlot::new(), owners.clone(), None);
+
+        hub.notify("alpha", ListKind::Resources);
+        assert!(
+            owners.read().unwrap().is_empty(),
+            "карта владельцев обязана сброситься"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_list_changed_leaves_the_resource_cache_alone() {
+        // Смена списка ИНСТРУМЕНТОВ маршрутизацию ресурсов не затрагивает:
+        // сбрасывать карту здесь значило бы дарить downstream'у способ
+        // заставлять гейтвей веерно перелистывать всех.
+        let owners = owners_with("mem://note", "alpha");
+        let hub = ListChangedHub::new(UpstreamSlot::new(), owners.clone(), None);
+
+        hub.notify("alpha", ListKind::Tools);
+        assert_eq!(owners.read().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_burst_from_many_servers_is_coalesced_into_one_send() {
+        // Пять downstream'ов, разом сообщивших об изменении, — это один факт
+        // «список больше не тот», а не пять. Наружу должно уйти одно
+        // уведомление на категорию.
+        let hub = ListChangedHub::new(
+            UpstreamSlot::new(),
+            Arc::new(RwLock::new(HashMap::new())),
+            None,
+        );
+        for server in ["a", "b", "c", "d", "e"] {
+            hub.notify(server, ListKind::Tools);
+        }
+        let scheduled = hub
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .get(&ListKind::Tools)
+            .map(|s| s.scheduled)
+            .unwrap_or(false);
+        assert!(scheduled, "отправка запланирована");
+        // Ровно одна запись на категорию — значит запланирована одна отправка,
+        // а не пять.
+        assert_eq!(hub.inner.state.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn every_incoming_notification_is_audited_with_its_source() {
+        // Наружу уходит одно уведомление, но расследование не должно терять,
+        // КТО именно менялся.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("calls.jsonl");
+        let log = crate::logger::start(path.clone(), crate::logger::DEFAULT_MAX_LOG_BYTES);
+        let hub = ListChangedHub::new(
+            UpstreamSlot::new(),
+            Arc::new(RwLock::new(HashMap::new())),
+            Some(log),
+        );
+
+        hub.notify("alpha", ListKind::Tools);
+        hub.notify("beta", ListKind::Tools);
+
+        let mut records = Vec::new();
+        for _ in 0..100 {
+            records = crate::logger::read_records(&path).unwrap_or_default();
+            if records.len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let sources: Vec<String> = records
+            .iter()
+            .filter(|r| r.tool == "list_changed")
+            .filter_map(|r| r.matched_rule.clone())
+            .collect();
+        assert_eq!(sources.len(), 2, "обе записи на месте: {sources:?}");
+        assert!(
+            sources.iter().any(|s| s.starts_with("alpha")),
+            "{sources:?}"
+        );
+        assert!(sources.iter().any(|s| s.starts_with("beta")), "{sources:?}");
+    }
 
     #[tokio::test]
     async fn empty_slot_times_out_instead_of_hanging() {

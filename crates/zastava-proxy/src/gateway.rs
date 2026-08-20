@@ -138,6 +138,9 @@ pub struct GatewayOptions {
     pub canon: Arc<RwLock<CanonRules>>,
     /// Общий с downstream-обработчиками мост progress-токенов.
     pub progress: crate::downstream::ProgressBridge,
+    /// Карта «URI ресурса → сервер». Общая с хабом list_changed: тот обязан
+    /// её чистить, когда downstream переставил свои ресурсы.
+    pub resource_owners: Arc<RwLock<HashMap<String, String>>>,
 }
 
 /// Гейтвей: реализация ServerHandler поверх множества downstream'ов.
@@ -223,7 +226,7 @@ impl Gateway {
             canon: options.canon,
             progress: options.progress,
             capabilities,
-            resource_owners: Arc::new(RwLock::new(HashMap::new())),
+            resource_owners: options.resource_owners,
         }
     }
 
@@ -400,6 +403,20 @@ fn downstream_error(context: String, e: &ServiceError) -> ErrorData {
 /// Объявляем только те возможности, которые реально есть хотя бы у одного
 /// downstream: обещать клиенту resources/prompts, которых никто не отдаёт, —
 /// врать (клиент будет слать запросы, на которые придёт пустота).
+/// Объявляет ли хоть один downstream уведомления об изменении своего списка.
+///
+/// Честность та же, что и с самими возможностями: обещать клиенту, что мы
+/// сообщим об изменениях, когда об этом никто не сообщает нам, — враньё.
+fn any_list_changed(
+    downstreams: &HashMap<String, DownstreamService>,
+    pick: impl Fn(&ServerCapabilities) -> Option<bool>,
+) -> bool {
+    downstreams
+        .values()
+        .filter_map(|ds| ds.peer_info())
+        .any(|info| pick(&info.capabilities) == Some(true))
+}
+
 fn merged_capabilities(downstreams: &HashMap<String, DownstreamService>) -> ServerCapabilities {
     let mut capabilities = ServerCapabilities::builder()
         .enable_tools()
@@ -415,6 +432,28 @@ fn merged_capabilities(downstreams: &HashMap<String, DownstreamService>) -> Serv
     }
     if !peers.iter().any(|p| p.capabilities.prompts.is_some()) {
         capabilities.prompts = None;
+    }
+
+    // listChanged объявляем, только если о своих изменениях сообщает хотя бы
+    // один downstream. Обещать клиенту уведомления, которых нам никто не шлёт,
+    // — то же враньё, что и объявлять чужие возможности.
+    if let Some(tools) = capabilities.tools.as_mut() {
+        tools.list_changed = any_list_changed(downstreams, |c| {
+            c.tools.as_ref().and_then(|t| t.list_changed)
+        })
+        .then_some(true);
+    }
+    if let Some(resources) = capabilities.resources.as_mut() {
+        resources.list_changed = any_list_changed(downstreams, |c| {
+            c.resources.as_ref().and_then(|r| r.list_changed)
+        })
+        .then_some(true);
+    }
+    if let Some(prompts) = capabilities.prompts.as_mut() {
+        prompts.list_changed = any_list_changed(downstreams, |c| {
+            c.prompts.as_ref().and_then(|p| p.list_changed)
+        })
+        .then_some(true);
     }
     capabilities
 }

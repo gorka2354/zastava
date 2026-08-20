@@ -21,7 +21,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use zastava_core::config::ServerConfig;
 
-use crate::downstream::{DownstreamHandler, ProgressBridge, UpstreamSlot};
+use crate::downstream::{DownstreamHandler, ListChangedHub, ProgressBridge, UpstreamSlot};
 use crate::error::ProxyError;
 
 /// Живое подключение к downstream-серверу. Уборка дерева процессов зашита в
@@ -40,11 +40,12 @@ pub async fn spawn_downstream(
     initialize_timeout: Duration,
     upstream: UpstreamSlot,
     progress: ProgressBridge,
+    lists: ListChangedHub,
 ) -> Result<Downstream, ProxyError> {
     let (transport, stderr) = spawn_transport(name, config)?;
     drain_stderr(name, stderr);
 
-    let handler = DownstreamHandler::with_progress(name, upstream, progress);
+    let handler = DownstreamHandler::with_bridges(name, upstream, progress, lists);
     let service = tokio::time::timeout(initialize_timeout, handler.serve(transport))
         .await
         .map_err(|_| ProxyError::InitializeTimeout {

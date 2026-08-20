@@ -45,6 +45,17 @@ pub async fn run(config: Config, options: RunOptions) -> Result<(), ProxyError> 
     let call_timeout = Duration::from_millis(config.proxy.call_timeout_ms);
     let list_timeout = Duration::from_millis(config.proxy.list_timeout_ms);
 
+    // Журнал ведётся ВСЕГДА, в том числе в passthrough: «контроль отключён»
+    // и «вызовов не было» обязаны различаться при чтении журнала постфактум
+    // (находка ревью M1 — иначе достаточно ZASTAVA_DISABLE=1 в чужом
+    // .mcp.json, чтобы работа стала неаудируемой и это осталось незаметным).
+    //
+    // Заводится ДО спавна: хаб list_changed пишет в него источник каждого
+    // уведомления, а сам хаб нужен уже downstream-обработчикам.
+    let log = options
+        .log_path
+        .map(|path| logger::start(path, logger::DEFAULT_MAX_LOG_BYTES));
+
     // Слот заводится ДО спавна: downstream'ы получают его пустым и ждут,
     // пока подключится настоящий клиент. Иначе никак — `Peer<RoleServer>`
     // рождается только в момент `serve`, то есть заведомо позже.
@@ -52,16 +63,28 @@ pub async fn run(config: Config, options: RunOptions) -> Result<(), ProxyError> 
     // Мост progress-токенов общий: его наполняет гейтвей на каждом вызове, а
     // читают обработчики всех downstream'ов.
     let progress = downstream::ProgressBridge::new();
+    // Карта владельцев ресурсов общая: её наполняет гейтвей на листинге, а
+    // чистит хаб list_changed, когда downstream переставил свои ресурсы.
+    let resource_owners = Arc::new(RwLock::new(HashMap::new()));
+    let lists =
+        downstream::ListChangedHub::new(upstream.clone(), resource_owners.clone(), log.clone());
 
     // Eager parallel spawn (T6.4): опоздавшие/упавшие не валят остальных.
     let mut join_set = tokio::task::JoinSet::new();
     for (name, server_config) in config.servers.clone() {
         let slot = upstream.clone();
         let bridge = progress.clone();
+        let hub = lists.clone();
         join_set.spawn(async move {
-            let result =
-                spawn::spawn_downstream(&name, &server_config, initialize_timeout, slot, bridge)
-                    .await;
+            let result = spawn::spawn_downstream(
+                &name,
+                &server_config,
+                initialize_timeout,
+                slot,
+                bridge,
+                hub,
+            )
+            .await;
             (name, result)
         });
     }
@@ -82,13 +105,6 @@ pub async fn run(config: Config, options: RunOptions) -> Result<(), ProxyError> 
 
     let policy = Arc::new(RwLock::new(PolicyEngine::from_config(&config.policy)));
 
-    // Журнал ведётся ВСЕГДА, в том числе в passthrough: «контроль отключён»
-    // и «вызовов не было» обязаны различаться при чтении журнала постфактум
-    // (находка ревью M1 — иначе достаточно ZASTAVA_DISABLE=1 в чужом
-    // .mcp.json, чтобы работа стала неаудируемой и это осталось незаметным).
-    let log = options
-        .log_path
-        .map(|path| logger::start(path, logger::DEFAULT_MAX_LOG_BYTES));
     if let Some(log) = &log {
         let detail = if options.passthrough {
             Some("policy disabled: --passthrough or ZASTAVA_DISABLE=1".to_string())
@@ -143,6 +159,7 @@ pub async fn run(config: Config, options: RunOptions) -> Result<(), ProxyError> 
             log_args: config.log.log_args,
             canon,
             progress,
+            resource_owners,
         },
     );
     let service = gateway
