@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::ConfigError;
+use crate::pathish;
 
 /// Разделитель неймспейса между сервером и инструментом.
 pub const NS_SEP: &str = "__";
@@ -212,18 +213,41 @@ pub enum ArgMatcher {
     AnyOf(AnyOfMatcher),
 }
 
-/// Приведение значения для префиксного сравнения.
+/// Совпадает ли значение с префиксным правилом.
 ///
-/// Префикс существует ради файловых и URL-границ, а там и `\` против `/`, и
-/// регистр — различия, которых сама ОС не делает: на Windows `C:\Work` и
-/// `c:/work` — одно место. Байтовое сравнение дало бы правило, которое либо
-/// молча никогда не совпадает (`learn` видит в журнале нормализованный путь),
-/// либо обходится сменой регистра. Приведение одинаково на всех платформах —
-/// политика обязана значить одно и то же на любой машине.
+/// Сравниваются НЕ строки, а компоненты пути. Строковый `starts_with`
+/// пропускал два обхода, воспроизведённых на живом гейтвее (ревью M3):
+/// - `C:/work/zastava/../../Users/alice/.ssh` — `..` уводит наружу;
+/// - `C:/work/zastava-private` — соседний каталог, чьё имя просто начинается
+///   так же.
+///
+/// Поэтому: обе стороны раскладываются лексически ([`pathish::resolve`]),
+/// `..` схлопывается, выход за корень отвергается целиком, а совпадение
+/// обязано заканчиваться НА ГРАНИЦЕ компонента.
+///
+/// Регистр и `\` против `/` складываются: на Windows `C:\Work` и `c:/work` —
+/// одно место, и правило, чувствительное к регистру, обходилось бы его
+/// сменой. Приведение одинаково на всех платформах — политика обязана
+/// значить одно и то же на любой машине.
 ///
 /// Точные матчеры (`exact`, `any_of`) остаются побайтовыми.
-fn fold_for_prefix(value: &str) -> String {
-    value.replace('\\', "/").to_lowercase()
+fn prefix_matches(prefix: &str, actual: &str) -> bool {
+    let (Some(want), Some(got)) = (pathish::resolve(prefix), pathish::resolve(actual)) else {
+        // Значение или префикс вышли за собственный корень — не совпадение.
+        return false;
+    };
+    let want = want.render().to_lowercase();
+    let got = got.render().to_lowercase();
+
+    if got == want {
+        return true;
+    }
+    let Some(tail) = got.strip_prefix(&want) else {
+        return false;
+    };
+    // Граница: либо префикс сам ею кончается, либо остаток с неё начинается.
+    // Без этой проверки `zastava` покрывал бы `zastava-private`.
+    want.ends_with(pathish::is_boundary) || tail.starts_with(pathish::is_boundary)
 }
 
 /// `{ prefix = "..." }`.
@@ -254,9 +278,7 @@ impl ArgMatcher {
         };
         match self {
             ArgMatcher::Exact(expected) => actual == expected,
-            ArgMatcher::Prefix(m) => {
-                fold_for_prefix(actual).starts_with(&fold_for_prefix(&m.prefix))
-            }
+            ArgMatcher::Prefix(m) => prefix_matches(&m.prefix, actual),
             ArgMatcher::AnyOf(m) => m.any_of.iter().any(|candidate| candidate == actual),
         }
     }
@@ -391,7 +413,9 @@ impl Config {
                     // аргументов» — почти всегда это забытая таблица args, а не
                     // намерение, и молча запрещать все вызовы инструмента мы
                     // не станем.
-                    if rule.deny_extra_args && rule.args.is_none() {
+                    if rule.deny_extra_args
+                        && rule.args.as_ref().is_none_or(BTreeMap::is_empty)
+                    {
                         problems.push(format!(
                             "rule '{}': deny_extra_args requires an args table",
                             rule.sig

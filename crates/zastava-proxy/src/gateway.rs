@@ -297,6 +297,7 @@ impl Gateway {
         // Имена приходят от клиента/downstream. Пишем в журнал только
         // экранированные: иначе управляющие последовательности переписывают
         // вывод `stats`/`learn`, где отчёт об этих же вызовах и читают.
+        let (raw_server, raw_tool) = (server, tool);
         let (server, server_dirty) = sanitize_name(server);
         let (tool, tool_dirty) = sanitize_name(tool);
         let (decision_str, enforced, matched_rule) = match decision {
@@ -319,8 +320,13 @@ impl Gateway {
             id: next_event_id(),
             canonical_subset: {
                 // Гуард живёт ровно на время вычисления и НЕ переживает await.
+                // Ищем по СЫРЫМ именам: экранирование меняет имя инструмента,
+                // и точечное правило `[[canon.rules]]` переставало находиться,
+                // откатываясь на более широкий whitelist — то есть недоверенная
+                // сторона решала бы, сколько её аргументов уедет в журнал
+                // открыто (находка ревью M3).
                 let canon = self.canon.read().expect("canon lock poisoned");
-                canon.subset(&server, &tool, args)
+                canon.subset(raw_server, raw_tool, args)
             },
             server,
             tool,

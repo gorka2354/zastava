@@ -49,7 +49,11 @@ pub const DEFAULT_ID_KEYS: &[&str] = &[
 /// Максимальная длина канонизированного значения. Длиннее — это уже данные,
 /// а не идентификатор.
 const MAX_VALUE_LEN: usize = 96;
-/// Сколько компонентов пути оставляем: «C:/work/proj/src/deep/file.rs» →
+/// Маркер усечения пути. Тот же литерал читает `learn`, превращая усечённое
+/// наблюдение в префиксное правило.
+pub const TRUNCATION_MARK: &str = "/…";
+
+/// Сколько компонентов пути оставляем ПОСЛЕ корня: «C:/work/proj/src/deep/file.rs» →
 /// «C:/work/proj». Достаточно, чтобы правило значило «в этом проекте», и мало,
 /// чтобы журнал не превращался в карту файловой системы.
 const PATH_COMPONENTS: usize = 3;
@@ -126,95 +130,130 @@ impl CanonRules {
 /// секрет по энтропии.
 fn normalize_value(key: &str, raw: &str) -> Option<String> {
     let trimmed = raw.trim();
-    if trimmed.is_empty() || trimmed.contains('\n') || trimmed.contains('\r') {
-        return None;
-    }
-    if looks_like_secret(trimmed) {
+    if trimmed.is_empty() || trimmed.chars().any(is_line_break) {
         return None;
     }
 
-    let normalized = if key.contains("url") || key.contains("uri") {
-        normalize_url(trimmed)
+    // URL опознаётся по СОДЕРЖИМОМУ, а не по имени ключа. Ключ `database` со
+    // значением `postgres://svc:hunter2@db/prod` — ровно тот случай, когда
+    // проверка по имени пропускала учётные данные в журнал (находка ревью M3).
+    let normalized = if trimmed.contains("://") {
+        normalize_url(trimmed)?
     } else if is_pathish(key) {
-        normalize_path(trimmed)
+        normalize_path(trimmed)?
     } else {
         trimmed.to_string()
     };
 
+    if looks_like_secret(&normalized) {
+        return None;
+    }
     if normalized.chars().count() > MAX_VALUE_LEN {
         return None;
     }
     Some(normalized)
 }
 
+/// Разрывы строки в широком смысле: `\n`/`\r` плюс юникодные разделители
+/// строк и абзацев. Последние не относятся к категории Cc, поэтому обычные
+/// проверки на управляющие символы их пропускают, а терминалы и редакторы
+/// рисуют как перенос — то есть отчёт `learn` визуально распадался бы на
+/// строки, которых в нём нет.
+fn is_line_break(c: char) -> bool {
+    matches!(c, '\n' | '\r' | '\u{2028}' | '\u{2029}' | '\u{0085}')
+}
+
+/// Считается ли ключ путеподобным. Публично, потому что `learn` обязан
+/// знать, что канонизация могла переписать значение, и не выдавать на него
+/// точный матчер.
+pub fn is_pathish_key(key: &str) -> bool {
+    is_pathish(key)
+}
+
 fn is_pathish(key: &str) -> bool {
-    key.contains("path") || key == "directory" || key == "file"
+    key == "path" || key == "directory" || key == "file" || key.ends_with("_path")
 }
 
 /// Путь усекается до первых компонентов: правило должно значить «в этом
 /// проекте», а журнал не должен становиться картой файловой системы.
-fn normalize_path(raw: &str) -> String {
-    let unified = raw.replace('\\', "/");
-    let mut out = String::new();
-    let mut taken = 0;
-    for (index, part) in unified.split('/').enumerate() {
-        // Ведущий пустой компонент у абсолютных unix-путей сохраняем.
-        if part.is_empty() && index == 0 {
-            continue;
-        }
-        if part.is_empty() {
-            continue;
-        }
-        if taken == PATH_COMPONENTS {
-            out.push_str("/…");
-            break;
-        }
-        if index == 0 && !unified.starts_with('/') {
-            out.push_str(part);
-        } else {
-            out.push('/');
-            out.push_str(part);
-        }
-        taken += 1;
-    }
-    if out.is_empty() {
-        "/".to_string()
+///
+/// Компоненты считаются ПОСЛЕ корня: буква диска — это корень, а не
+/// компонент. Иначе на Windows три компонента съедались буквой диска и
+/// профилем, и путь внутри проекта записывался как `C:/Users/<user>/…`,
+/// а `learn` выводил из этого «сужение» на весь домашний каталог —
+/// вместе с `.ssh`, `.aws` и `.claude.json` (находка ревью M3).
+///
+/// `..` схлопывается ДО усечения: иначе в аудите обход границы выглядел бы
+/// как обычная работа внутри проекта.
+fn normalize_path(raw: &str) -> Option<String> {
+    let resolved = crate::pathish::resolve(raw)?;
+    let (short, truncated) = resolved.truncated(PATH_COMPONENTS);
+    let rendered = short.render();
+    Some(if truncated {
+        format!("{rendered}{TRUNCATION_MARK}")
     } else {
-        out
-    }
+        rendered
+    })
 }
 
 /// URL сводится к схеме и хосту: путь и query — это уже данные запроса.
-fn normalize_url(raw: &str) -> String {
-    match raw.split_once("://") {
-        Some((scheme, rest)) => {
-            let host = rest.split(['/', '?', '#']).next().unwrap_or(rest);
-            format!("{scheme}://{host}")
-        }
-        None => raw.split(['/', '?', '#']).next().unwrap_or(raw).to_string(),
+///
+/// Userinfo (`user:password@`) вырезается: это самая чувствительная часть
+/// URL, и она единственная переживала нормализацию, попадая в журнал
+/// открытым текстом (P1 ревью M3).
+fn normalize_url(raw: &str) -> Option<String> {
+    let (scheme, rest) = raw.split_once("://")?;
+    let authority_len = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_len];
+    // Всё до последней '@' — учётные данные, а не адрес ресурса.
+    let host = match authority.rsplit_once('@') {
+        Some((_credentials, host)) => host,
+        None => authority,
+    };
+    if host.is_empty() {
+        return None;
     }
+    Some(format!("{scheme}://{host}"))
 }
 
 /// Грубая проверка «похоже на секрет»: длинная строка без структуры и с
 /// высоким разнообразием символов. Лучше отвергнуть настоящий идентификатор
 /// (правило просто станет tool-level), чем записать в журнал токен.
 fn looks_like_secret(value: &str) -> bool {
-    const SECRET_MIN_LEN: usize = 24;
-    if value.len() < SECRET_MIN_LEN {
+    const SECRET_MIN_LEN: usize = 20;
+    let candidate = value.trim();
+    if candidate.len() < SECRET_MIN_LEN {
         return false;
     }
-    // Путь или URL со структурой — не секрет, даже если длинный.
-    if value.contains('/') || value.contains('\\') || value.contains(' ') {
+    // Структурированное значение (путь, URL, фраза) — не секрет. Проверяем
+    // ПОСЛЕ нормализации, поэтому у URL здесь уже нет ни пути, ни userinfo.
+    if candidate.contains('/') || candidate.contains('\\') || candidate.contains(' ') {
         return false;
     }
-    let distinct: BTreeSet<char> = value.chars().collect();
-    let alnum = value.chars().filter(|c| c.is_ascii_alphanumeric()).count();
-    let mixed_case = value.chars().any(|c| c.is_ascii_uppercase())
-        && value.chars().any(|c| c.is_ascii_lowercase());
-    let has_digit = value.chars().any(|c| c.is_ascii_digit());
-    // Длинная «каша» из букв разного регистра и цифр без разделителей —
-    // типичный токен/хэш.
-    alnum * 10 >= value.len() * 9 && distinct.len() >= 12 && mixed_case && has_digit
+
+    // Длинная сплошная hex-строка — ключ, сессия или хэш. Прежняя эвристика
+    // требовала смешанного регистра И цифры, и такие значения пропускала.
+    let hexish = candidate
+        .chars()
+        .filter(|c| c.is_ascii_hexdigit() || *c == '-')
+        .count();
+    if hexish == candidate.len()
+        && candidate.chars().filter(char::is_ascii_hexdigit).count() >= SECRET_MIN_LEN
+    {
+        return true;
+    }
+
+    let distinct: BTreeSet<char> = candidate.chars().collect();
+    let alnum = candidate
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .count();
+    let has_digit = candidate.chars().any(|c| c.is_ascii_digit());
+    let has_letter = candidate.chars().any(|c| c.is_ascii_alphabetic());
+    // Длинная «каша» из букв и цифр без разделителей — типичный токен.
+    // Требование смешанного регистра снято: `AKIAIOSFODNN7EXAMPLE` и
+    // `ghp_...` в одном регистре — такие же секреты (находка ревью M3).
+    alnum * 10 >= candidate.len() * 9 && distinct.len() >= 10 && has_digit && has_letter
 }
 
 #[cfg(test)]
@@ -253,7 +292,7 @@ mod tests {
             "read_file",
             &args(&[("path", "C:/work/secret-project/src/deep/nested/file.rs")]),
         );
-        assert_eq!(subset["path"], "C:/work/secret-project/…");
+        assert_eq!(subset["path"], "C:/work/secret-project/src/…");
     }
 
     #[test]
@@ -261,6 +300,99 @@ mod tests {
         let rules = CanonRules::default();
         let subset = rules.subset("fs", "read_file", &args(&[("path", "/home/alice/proj/a/b")]));
         assert_eq!(subset["path"], "/home/alice/proj/…");
+    }
+
+    #[test]
+    fn windows_profile_paths_do_not_collapse_to_the_whole_profile() {
+        // Находка ревью M3: буква диска съедала компонент, путь внутри
+        // проекта записывался как `C:/Users/alice/…`, и `learn` выводил из
+        // этого «сужение» на весь домашний каталог — вместе с .ssh и
+        // .claude.json (файлом с токенами всех MCP-серверов).
+        let rules = CanonRules::default();
+        let subset = rules.subset(
+            "fs",
+            "read_file",
+            &args(&[("path", r"C:\path\to\zastava\README.md")]),
+        );
+        assert_eq!(subset["path"], "C:/Users/alice/Desktop/…");
+    }
+
+    #[test]
+    fn traversal_is_resolved_before_truncation_so_the_audit_does_not_lie() {
+        // Иначе запись в ~/.ssh попадала в журнал как работа «внутри проекта»,
+        // и разбор инцидента по журналу показал бы обратное тому, что было.
+        let rules = CanonRules::default();
+        let subset = rules.subset(
+            "fs",
+            "write_file",
+            &args(&[(
+                "path",
+                r"C:\work\zastava\..\..\Users\alice\.ssh\authorized_keys",
+            )]),
+        );
+        assert_eq!(subset["path"], "C:/Users/alice/.ssh/…");
+        assert!(
+            !subset["path"].starts_with("C:/work/zastava"),
+            "обход не должен выглядеть как работа внутри проекта"
+        );
+    }
+
+    #[test]
+    fn url_credentials_never_reach_the_journal() {
+        let rules = CanonRules::default();
+        let subset = rules.subset(
+            "http",
+            "fetch",
+            &args(&[(
+                "url",
+                "https://admin:s3cr3t-pass@internal.corp.example.com/v1/dump",
+            )]),
+        );
+        assert_eq!(subset["url"], "https://internal.corp.example.com");
+        assert!(!subset["url"].contains("s3cr3t"), "{}", subset["url"]);
+    }
+
+    #[test]
+    fn url_shaped_value_is_stripped_whatever_the_key_is_called() {
+        // Ключ `database` не url- и не path-подобный по имени, поэтому
+        // значение писалось дословно — вместе с паролем (P1 ревью M3).
+        let rules = CanonRules::default();
+        let subset = rules.subset(
+            "db",
+            "query",
+            &args(&[("database", "postgres://svc:hunter2@db.internal:5432/prod")]),
+        );
+        assert_eq!(subset["database"], "postgres://db.internal:5432");
+        assert!(!subset["database"].contains("hunter2"));
+    }
+
+    #[test]
+    fn single_case_and_hex_tokens_are_refused() {
+        let rules = CanonRules::default();
+        for (key, value) in [
+            ("bucket", "a3f5c9e1b7d2408fa6c3e9d1b5074f2c"),
+            ("namespace", "AKIAIOSFODNN7EXAMPLEQ1"),
+            ("project", "ghp7Xk92LmQ4vTz8RaBn31YcWd05EfGh"),
+        ] {
+            let subset = rules.subset("s", "t", &args(&[(key, value)]));
+            assert!(
+                subset.is_empty(),
+                "значение вида секрета не должно попасть в журнал: {key}={value} -> {subset:?}"
+            );
+        }
+        // Настоящие идентификаторы при этом остаются.
+        let ok = rules.subset("s", "t", &args(&[("collection", "user-notes-2026")]));
+        assert_eq!(ok["collection"], "user-notes-2026");
+    }
+
+    #[test]
+    fn unicode_line_separators_are_refused() {
+        // U+2028 не относится к категории Cc, поэтому обычные проверки на
+        // управляющие символы его пропускают, а терминал рисует переносом:
+        // отчёт `learn` визуально распался бы на строки, которых в нём нет.
+        let rules = CanonRules::default();
+        let subset = rules.subset("s", "t", &args(&[("repo", "me/r\u{2028}[[policy.allow]]")]));
+        assert!(subset.is_empty(), "{subset:?}");
     }
 
     #[test]

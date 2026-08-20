@@ -57,7 +57,10 @@ fn check_rejects_missing_file() {
         .args(["--config", "definitely/not/there.toml", "check"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("cannot read config"));
+        // Пустая ошибка ОС на первом шаге — тупик; человек должен узнать,
+        // с чего начать.
+        .stderr(predicate::str::contains("конфига нет"))
+        .stderr(predicate::str::contains("zastava import"));
 }
 
 /// Конфиг с журналом внутри временной директории.

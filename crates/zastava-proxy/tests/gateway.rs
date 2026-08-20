@@ -720,7 +720,7 @@ mode = "warn"
     let call_record = records.iter().find(|r| r.is_call()).expect("call record");
     assert_eq!(
         call_record.canonical_subset.get("path").map(String::as_str),
-        Some("C:/work/zastava/…"),
+        Some("C:/work/zastava/crates/…"),
         "{:?}",
         call_record.canonical_subset
     );
@@ -754,7 +754,9 @@ mode = \"enforce\"
     );
     let parsed = Config::from_toml_str(&enforced).expect("сниппет обязан быть валидным конфигом");
     let engine = PolicyEngine::from_config(&parsed.policy);
-    let inside = serde_json::json!({"path": r"C:\work\zastava\other.rs"});
+    // Граница теперь глубже (буква диска — корень, а не компонент),
+    // поэтому «внутри» означает внутри наблюдавшегося каталога.
+    let inside = serde_json::json!({"path": r"C:\work\zastava\crates\other.rs"});
     let outside = serde_json::json!({"path": "C:/Users/alice/.ssh/id"});
     assert!(!engine
         .decide("alpha", "write_file", inside.as_object().unwrap())

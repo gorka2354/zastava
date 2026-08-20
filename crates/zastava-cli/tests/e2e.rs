@@ -307,7 +307,10 @@ fn import_cannot_inject_a_policy_section() {
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&check.stdout);
-    assert!(stdout.contains("mode=Warn"), "{stdout}");
+    // Режим печатается ровно так, как его пишут в конфиг (`warn`, не
+    // `Warn`): вывод `check` не должен расходиться с тем, что пользователь
+    // пойдёт вставлять в файл.
+    assert!(stdout.contains("mode=warn"), "{stdout}");
     assert!(stdout.contains("rules=0"), "{stdout}");
 }
 

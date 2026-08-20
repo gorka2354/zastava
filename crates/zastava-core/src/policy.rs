@@ -11,7 +11,7 @@
 //! Дефолтный режим — warn (пост-спайк): tool-level гейтинг делегирован
 //! клиентскому `permissions.allow`, enforce включается осознанно.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{Map, Value};
 
@@ -60,6 +60,11 @@ struct CompiledRule {
 }
 
 impl CompiledRule {
+    /// Покрывает ли правило пару (server, tool) без учёта аргументов.
+    fn covers(&self, server: &str, tool: &str) -> bool {
+        self.server == server && (self.tool == "*" || self.tool == tool)
+    }
+
     /// Подходит ли правило под конкретный вызов.
     fn matches(&self, server: &str, tool: &str, args: &Map<String, Value>) -> bool {
         if self.server != server || (self.tool != "*" && self.tool != tool) {
@@ -132,16 +137,71 @@ impl PolicyEngine {
         self.rules.len()
     }
 
-    /// Есть ли правило, покрывающее пару (server, tool) на tool-уровне —
-    /// БЕЗ учёта аргументных матчеров. Нужно `learn`: правило с матчером
-    /// аргументов означает осознанное сужение, и предлагать поверх него
-    /// tool-level правило нельзя — это молча сняло бы ограничение.
-    /// Возвращает сигнатуру найденного правила и наличие у него матчеров.
+    /// Правило, покрывающее пару (server, tool), и ДЕЙСТВУЕТ ли его сужение.
+    ///
+    /// Второй элемент — не «у правила есть матчеры», а «доступ действительно
+    /// сужен». Разница существенна: выигрывает первое подошедшее правило, но
+    /// вызов, не совпавший с матчерами, идёт дальше по списку — и широкое
+    /// правило НИЖЕ пропускает всё, что узкое отклонило. Пока здесь стояло
+    /// «есть матчеры», `learn` печатал «уже сужено» ровно в тот момент, когда
+    /// гейт открыт настежь (находка ревью M3, независимо у двух линз).
     pub fn covering_rule(&self, server: &str, tool: &str) -> Option<(&str, bool)> {
+        let index = self
+            .rules
+            .iter()
+            .position(|rule| rule.covers(server, tool))?;
+        let rule = &self.rules[index];
+        if rule.args.is_empty() {
+            return Some((rule.raw.as_str(), false));
+        }
+        // Сужение действует, только если ниже нет правила без матчеров на ту
+        // же пару — иначе оно снято, и честный ответ «покрыто тем правилом».
+        match self.broad_rule_after(index, server, tool) {
+            Some(defeating) => Some((defeating.raw.as_str(), false)),
+            None => Some((rule.raw.as_str(), true)),
+        }
+    }
+
+    /// Первое правило ПОСЛЕ `index`, покрывающее пару без аргументных
+    /// ограничений.
+    fn broad_rule_after(&self, index: usize, server: &str, tool: &str) -> Option<&CompiledRule> {
+        self.rules[index + 1..]
+            .iter()
+            .find(|rule| rule.args.is_empty() && rule.covers(server, tool))
+    }
+
+    /// Аргументные правила, чьё сужение снято более поздним широким
+    /// правилом: `(суженное правило, правило, которое его снимает)`.
+    ///
+    /// Ровно это делает `zastava allow <server>__*`, дописывающий правило в
+    /// конец файла: аргументные ограничения перестают действовать, а на вид
+    /// остаются в конфиге.
+    pub fn defeated_narrowings(&self) -> Vec<(&str, &str)> {
         self.rules
             .iter()
-            .find(|rule| rule.server == server && (rule.tool == "*" || rule.tool == tool))
-            .map(|rule| (rule.raw.as_str(), !rule.args.is_empty()))
+            .enumerate()
+            .filter(|(_, rule)| !rule.args.is_empty())
+            .filter_map(|(index, rule)| {
+                let tool = if rule.tool == "*" { "*" } else { &rule.tool };
+                self.broad_rule_after(index, &rule.server, tool)
+                    .map(|defeating| (rule.raw.as_str(), defeating.raw.as_str()))
+            })
+            .collect()
+    }
+
+    /// Сигнатуры правил, чьё аргументное сужение ДЕЙСТВУЕТ. Снимок для
+    /// сравнения политики до и после reload.
+    pub fn effective_narrowings(&self) -> BTreeSet<String> {
+        let defeated: BTreeSet<&str> = self
+            .defeated_narrowings()
+            .into_iter()
+            .map(|(narrow, _)| narrow)
+            .collect();
+        self.rules
+            .iter()
+            .filter(|rule| !rule.args.is_empty() && !defeated.contains(rule.raw.as_str()))
+            .map(|rule| rule.raw.clone())
+            .collect()
     }
 
     /// Решение по вызову инструмента `server`/`tool` с аргументами `args`.
@@ -287,6 +347,72 @@ args = { path = { prefix = "C:/work/zastava" } }
     }
 
     #[test]
+    fn prefix_is_a_directory_boundary_not_a_string_prefix() {
+        // Три независимых ревью M3 воспроизвели на живом гейтвее один и тот же
+        // обход: `prefix` был `starts_with` по строке. Правило продаётся как
+        // «только в этом проекте» — значит, обязано быть границей каталога.
+        let toml = r#"
+[servers.fs]
+command = "x"
+[policy]
+mode = "enforce"
+[[policy.allow]]
+sig = "fs__write"
+args = { path = { prefix = "C:/work/zastava" } }
+"#;
+        let e = engine(toml);
+        let verdict = |path: &str| e.decide("fs", "write", &args(&[("path", path)]));
+
+        // Внутри границы — проходит, в том числе с windows-разделителями.
+        assert!(!verdict(r"C:\work\zastava\src\main.rs").blocks());
+        assert!(!verdict("C:/work/zastava").blocks(), "сама граница");
+        assert!(
+            !verdict(r"c:\WORK\Zastava\x").blocks(),
+            "регистр складывается"
+        );
+
+        // `..` уводит наружу.
+        assert!(
+            verdict(r"C:\work\zastava\..\..\Users\alice\.ssh\authorized_keys").blocks(),
+            "обход через .. обязан блокироваться"
+        );
+        assert!(verdict("C:/work/zastava/../.env").blocks());
+        // Возврат внутрь границы — законный путь, блокировать его не за что.
+        assert!(!verdict("C:/work/zastava/src/../notes.md").blocks());
+
+        // Сосед, чьё имя просто начинается так же.
+        assert!(
+            verdict("C:/work/zastava-private/secrets.env").blocks(),
+            "граница компонента обязана проверяться"
+        );
+        assert!(verdict("C:/work/zastava.bak/id_rsa").blocks());
+        assert!(verdict("C:/work/zastavaEVIL/x").blocks());
+    }
+
+    #[test]
+    fn url_prefix_covers_paths_and_queries_but_not_other_hosts() {
+        let toml = r#"
+[servers.http]
+command = "x"
+[policy]
+mode = "enforce"
+[[policy.allow]]
+sig = "http__fetch"
+args = { url = { prefix = "https://api.example.com" } }
+"#;
+        let e = engine(toml);
+        let verdict = |url: &str| e.decide("http", "fetch", &args(&[("url", url)]));
+        assert!(!verdict("https://api.example.com/v1/users?page=2").blocks());
+        assert!(!verdict("https://api.example.com").blocks());
+        assert!(!verdict("https://api.example.com?x=1").blocks());
+        assert!(
+            verdict("https://api.example.com.evil.tld/x").blocks(),
+            "чужой хост с тем же началом имени"
+        );
+        assert!(verdict("https://other.example.com/v1").blocks());
+    }
+
+    #[test]
     fn any_of_matcher_accepts_listed_values_only() {
         let toml = r#"
 [servers.github]
@@ -399,6 +525,60 @@ args = { repo = "safe/repo" }
         assert_eq!(sig, "github__create_issue");
         assert!(narrowed, "и помечается как суженное аргументами");
         assert!(e.covering_rule("github", "other").is_none());
+    }
+
+    #[test]
+    fn a_broad_rule_below_defeats_the_narrow_one_and_we_say_so() {
+        // Ровно то, что делает `zastava allow <server>__*`: правило
+        // дописывается в конец и снимает все аргументные ограничения, оставаясь
+        // на вид безобидной строкой в конфиге (P1 ревью M3).
+        let toml = r#"
+[servers.fs]
+command = "x"
+[policy]
+mode = "enforce"
+[[policy.allow]]
+sig = "fs__read"
+args = { path = { prefix = "C:/work/zastava" } }
+[[policy.allow]]
+sig = "fs__*"
+"#;
+        let e = engine(toml);
+        // Фактически сужения больше нет.
+        assert!(!e
+            .decide("fs", "read", &args(&[("path", "C:/Users/alice/.ssh/id")]))
+            .blocks());
+        // И движок обязан это признавать, а не показывать правило живым.
+        assert_eq!(e.defeated_narrowings(), vec![("fs__read", "fs__*")]);
+        assert!(
+            e.effective_narrowings().is_empty(),
+            "снятое сужение не должно считаться действующим"
+        );
+        assert_eq!(
+            e.covering_rule("fs", "read"),
+            Some(("fs__*", false)),
+            "learn обязан узнать, что сужение снято"
+        );
+    }
+
+    #[test]
+    fn a_narrow_rule_without_a_broad_one_below_stays_effective() {
+        let toml = r#"
+[servers.fs]
+command = "x"
+[[policy.allow]]
+sig = "fs__read"
+args = { path = { prefix = "C:/work/zastava" } }
+[[policy.allow]]
+sig = "fs__list"
+"#;
+        let e = engine(toml);
+        assert!(e.defeated_narrowings().is_empty());
+        assert_eq!(
+            e.effective_narrowings().into_iter().collect::<Vec<_>>(),
+            vec!["fs__read".to_string()]
+        );
+        assert_eq!(e.covering_rule("fs", "read"), Some(("fs__read", true)));
     }
 
     #[test]

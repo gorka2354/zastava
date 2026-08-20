@@ -23,6 +23,7 @@ notify = "8"
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 toml = "0.9"
+toml_edit = { version = "0.24", features = ["serde"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"

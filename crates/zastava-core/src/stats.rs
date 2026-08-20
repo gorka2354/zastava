@@ -20,6 +20,18 @@ pub struct StatsSummary {
     pub per_server: BTreeMap<String, u64>,
     /// Deny-вердиктов (включая warn-режим, где они не блокировали).
     pub denies: u64,
+    /// Из них ФАКТИЧЕСКИ заблокировано. В warn-режиме — ноль, и разница
+    /// между этими двумя числами обязана быть видна: пользователь, глядящий
+    /// на «deny-вердиктов: 847», иначе считает, что его 847 раз прикрыли,
+    /// тогда как не прикрыли ни разу (находка продуктового ревью M3).
+    pub blocked: u64,
+    /// Вызовы, записанные прошлыми поколениями канонизации. Смешивать их со
+    /// свежими в подсчёте уникальности нельзя — иначе один и тот же вызов
+    /// считается двумя разными сигнатурами.
+    pub legacy_calls: u64,
+    /// Строк журнала, которые не удалось прочитать. Побитый журнал не должен
+    /// выглядеть как пустой.
+    pub unreadable_lines: u64,
     /// Ошибочных вызовов (включая таймауты).
     pub errors: u64,
     /// Вызовов, брошенных по таймауту (побочный эффект мог состояться).
@@ -70,13 +82,23 @@ pub fn summarize(records: &[CallRecord]) -> StatsSummary {
         *summary.per_server.entry(record.server.clone()).or_default() += 1;
         if record.decision == "deny" {
             summary.denies += 1;
+            if record.enforced {
+                summary.blocked += 1;
+            }
+        }
+        if record.canon_version != crate::signature::CANON_VERSION {
+            summary.legacy_calls += 1;
         }
         if record.is_error {
             summary.errors += 1;
         }
+        // Версия канонизации в ключ НЕ входит: после апгрейда один и тот же
+        // вызов считался бы двумя разными сигнатурами, а M/N — единственная
+        // цифра, которой продукт доказывает пользу, — занижалась вдвое
+        // (находка ревью M3). Факт смешения поколений виден отдельно.
         let sig_key = format!(
-            "{}\u{1f}{}\u{1f}{:?}\u{1f}{}",
-            record.server, record.tool, record.canonical_subset, record.canon_version
+            "{}\u{1f}{}\u{1f}{:?}",
+            record.server, record.tool, record.canonical_subset
         );
         seen_with_args.insert(format!("{sig_key}\u{1f}{}", record.args_hash));
         if !seen.insert(sig_key) {

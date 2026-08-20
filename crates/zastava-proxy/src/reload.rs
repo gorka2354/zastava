@@ -164,5 +164,19 @@ fn describe_weakening(current: &PolicyEngine, next: &Config) -> Option<String> {
             next.policy.allow.len()
         ));
     }
+    // Самое M3-специфичное ослабление: правил столько же, но аргументное
+    // сужение снято — удалением таблицы `args` или широким правилом ниже.
+    // Счётчик правил такое не замечает, и ослабление уезжало в журнал
+    // безобидным `policy_reloaded` (находка всех трёх ревью M3).
+    let was = current.effective_narrowings();
+    let now = PolicyEngine::from_config(&next.policy).effective_narrowings();
+    let lost: Vec<&str> = was
+        .iter()
+        .filter(|sig| !now.contains(*sig))
+        .map(String::as_str)
+        .collect();
+    if !lost.is_empty() {
+        reasons.push(format!("narrowing lost: {}", lost.join(", ")));
+    }
     (!reasons.is_empty()).then(|| reasons.join(", "))
 }

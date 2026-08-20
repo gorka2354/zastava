@@ -9,7 +9,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
 use clap::{Parser, Subcommand};
-use zastava_core::config::{is_safe_sig, parse_sig, ArgMatcher, PolicyMode, ServerConfig};
+use zastava_core::config::{
+    is_safe_sig, parse_sig, ArgMatcher, DefaultAction, PolicyMode, ServerConfig, NS_SEP,
+};
 use zastava_core::Config;
 
 /// Обёртка для сериализации импортированных серверов в TOML.
@@ -58,6 +60,20 @@ enum Command {
     Allow {
         /// Сигнатура: <server>__<tool> или <server>__*.
         sig: String,
+        /// Добавить, даже если правило снимает существующее аргументное
+        /// сужение (по умолчанию такое отклоняется).
+        #[arg(long)]
+        force: bool,
+    },
+    /// Последние события журнала с их идентификаторами — то, чем потом
+    /// пользуется `annotate`.
+    Events {
+        /// Сколько последних событий показать.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Только отказы (deny/rejected).
+        #[arg(long)]
+        denied: bool,
     },
     /// Черновики правил из журнала: TOML для zastava.toml + сниппет
     /// клиентского permissions.allow.
@@ -96,7 +112,8 @@ fn main() -> anyhow::Result<()> {
         Command::Check => check(&config_path),
         Command::Run { passthrough } => run(&config_path, passthrough),
         Command::Stats => stats(&config_path),
-        Command::Allow { sig } => allow(&config_path, &sig),
+        Command::Allow { sig, force } => allow(&config_path, &sig, force),
+        Command::Events { limit, denied } => events(&config_path, limit, denied),
         Command::Learn => learn(&config_path),
         Command::Annotate { event_id, note } => annotate(&config_path, &event_id, &note),
         Command::Import { from, force } => import(&config_path, from.as_deref(), force),
@@ -116,8 +133,19 @@ fn resolve_config_path(explicit: Option<&Path>) -> PathBuf {
 }
 
 fn load_config(path: &Path) -> anyhow::Result<Config> {
-    let raw = std::fs::read_to_string(path)
-        .with_context(|| format!("cannot read config: {}", path.display()))?;
+    let raw = std::fs::read_to_string(path).with_context(|| {
+        if path.exists() {
+            format!("cannot read config: {}", path.display())
+        } else {
+            // Пустая ошибка ОС на первом же шаге — тупик: человек не знает
+            // ни где должен лежать файл, ни как его создать.
+            format!(
+                "конфига нет: {}
+Создай его импортом из клиента: zastava import",
+                path.display()
+            )
+        }
+    })?;
     Config::from_toml_str(&raw).with_context(|| format!("invalid config: {}", path.display()))
 }
 
@@ -146,11 +174,18 @@ fn check(path: &Path) -> anyhow::Result<()> {
             .join(", ")
     );
     println!(
-        "  policy:  mode={:?} default={:?} rules={}",
-        config.policy.mode,
-        config.policy.default,
+        "  policy:  mode={} default={} rules={}",
+        mode_name(config.policy.mode),
+        default_name(config.policy.default),
         config.policy.allow.len()
     );
+    // Дефолт — warn, и в нём НИЧЕГО не блокируется. Слово `deny` рядом с ним
+    // успокаивает ровно тогда, когда защиты нет: продуктовое ревью M3 прошло
+    // сценарий целиком и вышло из него с ложным чувством защищённости.
+    if config.policy.mode == PolicyMode::Warn {
+        println!("           ⚠ warn: вызовы НЕ блокируются, вердикты только пишутся в журнал.");
+        println!("             Когда правила обкатаются — mode = \"enforce\".");
+    }
     for rule in &config.policy.allow {
         match &rule.args {
             Some(args) => {
@@ -168,6 +203,20 @@ fn check(path: &Path) -> anyhow::Result<()> {
             }
             None => println!("    allow {}  (tool-level)", rule.sig),
         }
+    }
+    // Затенённое правило выглядит в конфиге живым, но не действует. Молчать
+    // об этом нельзя: `zastava allow <server>__*` дописывает правило в конец
+    // и снимает все аргументные сужения выше (P1 ревью M3).
+    let engine = zastava_core::PolicyEngine::from_config(&config.policy);
+    let defeated = engine.defeated_narrowings();
+    if !defeated.is_empty() {
+        println!();
+        println!("  ⛔ СУЖЕНИЕ НЕ ДЕЙСТВУЕТ — правило ниже пропускает то, что узкое отклонило:");
+        for (narrow, by) in &defeated {
+            println!("     {narrow} снято правилом {by}");
+        }
+        println!("     Убери широкое правило или подними узкое выше него.");
+        println!();
     }
     // Что именно уедет в журнал открыто — вопрос приватности, и ответ на него
     // должен быть виден до первого вызова, а не после разбора инцидента.
@@ -212,24 +261,85 @@ fn run(path: &Path, passthrough_flag: bool) -> anyhow::Result<()> {
 /// файла и пустая история обязаны выглядеть по-разному, а ошибка чтения не
 /// должна маскироваться под «вызовов не было» (находка ревью M1).
 fn read_journal(log_path: &Path) -> anyhow::Result<Option<Vec<zastava_core::CallRecord>>> {
+    Ok(read_journal_counted(log_path)?.map(|(records, _)| records))
+}
+
+/// То же, но с числом строк, которые не удалось прочитать.
+fn read_journal_counted(
+    log_path: &Path,
+) -> anyhow::Result<Option<(Vec<zastava_core::CallRecord>, usize)>> {
     // Читаем вместе с отротированными поколениями: иначе после первой же
     // ротации история для пользователя начиналась с нуля.
-    match zastava_proxy::logger::read_all_generations(log_path) {
-        Ok(records) => Ok(Some(records)),
+    match zastava_proxy::logger::read_all_generations_counted(log_path) {
+        Ok(found) => Ok(Some(found)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e).with_context(|| format!("cannot read journal: {}", log_path.display())),
     }
 }
 
-fn stats(path: &Path) -> anyhow::Result<()> {
+/// Показывает хвост журнала.
+///
+/// Без неё `annotate <event_id>` было нечем пользоваться: идентификатор
+/// существовал только внутри JSONL-файла, и справка предлагала пользователю
+/// открыть его руками (находка продуктового ревью M3).
+fn events(path: &Path, limit: usize, denied_only: bool) -> anyhow::Result<()> {
     let config = load_config(path)?;
     let log_path = resolve_log_path(&config);
     let Some(records) = read_journal(&log_path)? else {
         println!("Журнал ещё не создан: {}", log_path.display());
+        return Ok(());
+    };
+
+    let selected: Vec<&zastava_core::CallRecord> = records
+        .iter()
+        .filter(|r| !denied_only || r.decision == "deny" || r.decision == "rejected")
+        .rev()
+        .take(limit)
+        .collect();
+    if selected.is_empty() {
+        println!("Подходящих событий в журнале нет.");
+        return Ok(());
+    }
+    println!("{:<24} {:<20} {:<10} ЧТО", "ID", "ВРЕМЯ", "РЕШЕНИЕ");
+    for record in selected.iter().rev() {
+        let what = if record.is_call() {
+            format!("{}{}{}", record.server, NS_SEP, record.tool)
+        } else {
+            format!("[событие] {}", record.tool)
+        };
+        let decision = if record.is_call() {
+            let blocked = if record.decision == "deny" && !record.enforced {
+                "deny(warn)"
+            } else {
+                record.decision.as_str()
+            };
+            blocked.to_string()
+        } else {
+            "-".to_string()
+        };
+        println!(
+            "{:<24} {:<20} {:<10} {}",
+            record.id,
+            record.ts.chars().take(19).collect::<String>(),
+            decision,
+            what
+        );
+    }
+    println!();
+    println!("Отметить событие: zastava annotate <ID> \"чем помогло или почему ложное\"");
+    Ok(())
+}
+
+fn stats(path: &Path) -> anyhow::Result<()> {
+    let config = load_config(path)?;
+    let log_path = resolve_log_path(&config);
+    let Some((records, unreadable)) = read_journal_counted(&log_path)? else {
+        println!("Журнал ещё не создан: {}", log_path.display());
         println!("(это НЕ то же самое, что «вызовов не было»)");
         return Ok(());
     };
-    let summary = zastava_core::stats::summarize(&records);
+    let mut summary = zastava_core::stats::summarize(&records);
+    summary.unreadable_lines = unreadable as u64;
 
     println!("Журнал: {}", log_path.display());
     println!("  вызовов:            {}", summary.total);
@@ -243,7 +353,31 @@ fn stats(path: &Path) -> anyhow::Result<()> {
         None => println!("  повторов (M/N):      —"),
     }
     println!("  deny-вердиктов:      {}", summary.denies);
+    // Вердикт и блокировка — разные вещи, и в warn-режиме второе всегда ноль.
+    // Пользователь, читающий «deny-вердиктов: 847», иначе уверен, что его 847
+    // раз прикрыли (находка продуктового ревью M3).
+    println!(
+        "  из них заблокировано: {}{}",
+        summary.blocked,
+        if summary.denies > 0 && summary.blocked == 0 {
+            "  ← warn-режим: не заблокировано НИ ОДНОГО"
+        } else {
+            ""
+        }
+    );
     println!("  ошибок/таймаутов:    {}", summary.errors);
+    if summary.legacy_calls > 0 {
+        println!(
+            "  записей прошлых версий: {} (аргументы в них не сохранялись — learn их не учитывает)",
+            summary.legacy_calls
+        );
+    }
+    if summary.unreadable_lines > 0 {
+        println!(
+            "  ⚠ НЕЧИТАЕМЫХ строк:  {} — журнал повреждён, часть истории потеряна",
+            summary.unreadable_lines
+        );
+    }
     if summary.abandoned > 0 {
         println!(
             "  брошено по таймауту: {} (побочный эффект мог состояться)",
@@ -280,7 +414,7 @@ fn stats(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn allow(path: &Path, sig: &str) -> anyhow::Result<()> {
+fn allow(path: &Path, sig: &str, force: bool) -> anyhow::Result<()> {
     let config = load_config(path)?;
     let parsed = parse_sig(sig).with_context(|| {
         format!("malformed sig '{sig}': expected <server>__<tool> or <server>__*")
@@ -307,6 +441,31 @@ fn allow(path: &Path, sig: &str) -> anyhow::Result<()> {
     if config.policy.allow.iter().any(|rule| rule.sig == sig) {
         println!("Правило уже есть: {sig}");
         return Ok(());
+    }
+
+    // Правило дописывается в КОНЕЦ, а выигрывает первое подошедшее — значит
+    // широкое правило снимает все аргументные сужения выше. Продуктовое ревью
+    // M3 прошло это вживую: `zastava allow echo__*` открыл доступ в ~/.ssh,
+    // а `check` продолжал показывать узкое правило действующим.
+    let mut probe = config.policy.clone();
+    probe.allow.push(zastava_core::config::RuleConfig {
+        sig: sig.to_string(),
+        args: None,
+        deny_extra_args: false,
+    });
+    let probe_engine = zastava_core::PolicyEngine::from_config(&probe);
+    let defeated = probe_engine.defeated_narrowings();
+    if !defeated.is_empty() && !force {
+        let list = defeated
+            .iter()
+            .map(|(narrow, _)| *narrow)
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!(
+            "правило '{sig}' снимет аргументное сужение: {list}
+             Оно шире и стоит ниже, поэтому пропустит всё, что узкое отклоняет.
+             Если это осознанно — повтори с --force."
+        );
     }
 
     // Дописывание блока в конец, а не round-trip через сериализатор:
@@ -355,7 +514,13 @@ fn learn(path: &Path) -> anyhow::Result<()> {
         println!();
     }
     if output.proposals.is_empty() {
-        println!("Непокрытых сигнатур для этого конфига нет — предлагать нечего.");
+        // «Журнал пуст» и «всё уже покрыто» — разные состояния, и советы у
+        // них разные (находка продуктового ревью M3).
+        if records.iter().all(|r| !r.is_call()) {
+            println!("В журнале ещё нет вызовов — поработай через заставу, потом возвращайся.");
+        } else {
+            println!("Непокрытых сигнатур для этого конфига нет — предлагать нечего.");
+        }
         return Ok(());
     }
     println!(
@@ -380,6 +545,12 @@ fn learn(path: &Path) -> anyhow::Result<()> {
                 "#   {} — {calls} вызов(ов), сузить по аргументам нечем",
                 proposal.sig
             ),
+        }
+        if proposal.legacy_calls > 0 {
+            println!(
+                "#     (+{} записей прошлых версий заставы — аргументы в них не сохранялись)",
+                proposal.legacy_calls
+            );
         }
     }
     println!();
@@ -438,11 +609,13 @@ fn annotate(config_path: &Path, event_id: &str, note: &str) -> anyhow::Result<()
         ),
     };
 
+    // У заметки СВОЙ идентификатор: две записи с одинаковым id сделали бы
+    // журнал неоднозначным, а на аннотируемое событие ссылается текст.
     let record = zastava_core::CallRecord::marker(
         zastava_proxy::util::now_rfc3339(),
-        event_id.to_string(),
+        zastava_proxy::util::next_event_id(),
         "annotation",
-        Some(detail),
+        Some(format!("{event_id}: {detail}")),
     );
     let line = record.to_jsonl();
     append_line(&log_path, &line)?;
@@ -465,6 +638,23 @@ fn append_line(path: &Path, line: &str) -> anyhow::Result<()> {
     file.write_all(&buf)
         .with_context(|| format!("cannot append to journal {}", path.display()))?;
     Ok(())
+}
+
+/// Имя режима ровно в том виде, в каком его пишут в конфиг. Debug-формат
+/// печатал `Warn`, а конфиг требует `warn` — вывод команды `check` не должен
+/// расходиться с тем, что пользователь пойдёт вставлять в файл.
+fn mode_name(mode: PolicyMode) -> &'static str {
+    match mode {
+        PolicyMode::Warn => "warn",
+        PolicyMode::Enforce => "enforce",
+    }
+}
+
+fn default_name(action: DefaultAction) -> &'static str {
+    match action {
+        DefaultAction::Deny => "deny",
+        DefaultAction::Allow => "allow",
+    }
 }
 
 /// Человекочитаемое описание матчера для вывода `learn`.
@@ -638,7 +828,14 @@ fn write_private(path: &Path, content: &str) -> anyhow::Result<()> {
     }
     #[cfg(not(unix))]
     {
+        // На Windows права наследуются от каталога. Импорт переносит `env`
+        // (то есть токены), и молчать об этом нельзя.
         std::fs::write(path, content)?;
+        eprintln!(
+            "ВНИМАНИЕ: {} содержит переменные окружения серверов (возможно, токены).
+             Права файла не сужены — проверь доступ к нему вручную.",
+            path.display()
+        );
         Ok(())
     }
 }

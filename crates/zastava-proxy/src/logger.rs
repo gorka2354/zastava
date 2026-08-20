@@ -114,8 +114,28 @@ fn rotate_if_needed(path: &Path, max_bytes: u64) -> std::io::Result<()> {
 /// Читает журнал: незнакомые строки пропускаются молча (журнал мог писаться
 /// другой версией — best effort по решению ревью).
 pub fn read_records(path: &Path) -> std::io::Result<Vec<CallRecord>> {
+    Ok(read_counted(path)?.0)
+}
+
+/// Как `read_records`, но вторым элементом — число НЕПРОЧИТАННЫХ строк.
+///
+/// Молчаливый пропуск битых строк делал повреждённый журнал побайтово
+/// неотличимым от пустого (`вызовов: 0`) — для инструмента, чей товар есть
+/// доказательство происходившего, это худший вид отказа (находка ревью M3).
+pub fn read_counted(path: &Path) -> std::io::Result<(Vec<CallRecord>, usize)> {
     let content = std::fs::read_to_string(path)?;
-    Ok(content.lines().filter_map(CallRecord::from_jsonl).collect())
+    let mut records = Vec::new();
+    let mut unreadable = 0;
+    for line in content.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match CallRecord::from_jsonl(line) {
+            Some(record) => records.push(record),
+            None => unreadable += 1,
+        }
+    }
+    Ok((records, unreadable))
 }
 
 /// Читает журнал ВМЕСТЕ с отротированными поколениями, от старых к новым.
@@ -125,19 +145,30 @@ pub fn read_records(path: &Path) -> std::io::Result<Vec<CallRecord>> {
 /// Ошибка чтения текущего файла пробрасывается (её обязан различать вызывающий),
 /// недоступные поколения пропускаются с предупреждением.
 pub fn read_all_generations(path: &Path) -> std::io::Result<Vec<CallRecord>> {
+    Ok(read_all_generations_counted(path)?.0)
+}
+
+/// Как `read_all_generations`, но с числом непрочитанных строк по всем
+/// поколениям.
+pub fn read_all_generations_counted(path: &Path) -> std::io::Result<(Vec<CallRecord>, usize)> {
     let mut records = Vec::new();
+    let mut unreadable = 0;
     for n in (1..=ROTATION_KEEP).rev() {
         let generation = path.with_extension(format!("jsonl.{n}"));
-        match std::fs::read_to_string(&generation) {
-            Ok(content) => records.extend(content.lines().filter_map(CallRecord::from_jsonl)),
+        match read_counted(&generation) {
+            Ok((found, skipped)) => {
+                records.extend(found);
+                unreadable += skipped;
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => {
                 tracing::warn!(error = %e, path = %generation.display(), "log generation unreadable")
             }
         }
     }
-    records.extend(read_records(path)?);
-    Ok(records)
+    let (current, skipped) = read_counted(path)?;
+    records.extend(current);
+    Ok((records, unreadable + skipped))
 }
 
 #[cfg(test)]

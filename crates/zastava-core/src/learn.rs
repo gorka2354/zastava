@@ -12,19 +12,22 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::canon::{self, TRUNCATION_MARK};
 use crate::config::{
     is_safe_sig, sanitize_name, AnyOfMatcher, ArgMatcher, Config, PrefixMatcher, RuleConfig, NS_SEP,
 };
+use crate::pathish;
 use crate::policy::PolicyEngine;
 use crate::record::CallRecord;
+use crate::signature::CANON_VERSION;
 
 /// Сколько разных значений ключа ещё считаем «набором», а не разнообразием.
 /// Выше порога ключ не идентифицирует ресурс: правило из двадцати значений
 /// никто не прочитает, а сузит оно ровно ничего.
 const MAX_DISTINCT_VALUES: usize = 4;
 
-/// Маркер усечения пути, который ставит канонизация.
-const TRUNCATION_MARK: &str = "/…";
+/// Псевдо-инструменты аудита (чтение ресурса, получение промпта).
+const PSEUDO_TOOL_PREFIX: &str = "zastava.";
 
 /// Черновик одного правила.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,6 +38,9 @@ pub struct Proposal {
     pub args: Option<BTreeMap<String, ArgMatcher>>,
     /// Сколько вызовов наблюдалось — на этом человек и строит доверие.
     pub calls: usize,
+    /// Сколько вызовов записано прошлыми версиями заставы: по ним об
+    /// аргументах судить нельзя, и молчать об этом нечестно.
+    pub legacy_calls: usize,
 }
 
 impl Proposal {
@@ -79,7 +85,14 @@ impl LearnOutput {
 /// Наблюдения по одной сигнатуре.
 #[derive(Default)]
 struct Observations {
+    /// Вызовы ТЕКУЩЕГО поколения канонизации — только по ним можно судить
+    /// об аргументах.
     calls: usize,
+    /// Вызовы, записанные прошлыми версиями заставы. Их `canonical_subset`
+    /// пуст по построению, и если считать их наравне, то одна старая запись
+    /// обнуляет сужение для всего инструмента: ключ перестаёт встречаться
+    /// «во всех вызовах» (находка ревью M3 — ломалось у всех, кто обновится).
+    legacy_calls: usize,
     /// Ключ → множество канонических значений.
     values: BTreeMap<String, BTreeSet<String>>,
     /// В скольких вызовах встречался ключ: требовать в правиле можно только
@@ -114,6 +127,12 @@ pub fn suggest(records: &[CallRecord], config: &Config) -> LearnOutput {
             foreign.insert(sig);
             continue;
         }
+        // Чтение ресурса и получение промпта пишутся в аудит псевдо-именами,
+        // но инструментами не являются и политикой не оцениваются. Предлагать
+        // на них правила — засорять конфиг мёртвыми строками.
+        if record.tool.starts_with(PSEUDO_TOOL_PREFIX) {
+            continue;
+        }
         match engine.covering_rule(&record.server, &record.tool) {
             Some((rule, true)) => {
                 narrowed.insert(format!("{sig} (уже сужено правилом {rule})"));
@@ -121,6 +140,10 @@ pub fn suggest(records: &[CallRecord], config: &Config) -> LearnOutput {
             Some((_, false)) => {}
             None => {
                 let entry = seen.entry(sig).or_default();
+                if record.canon_version != CANON_VERSION {
+                    entry.legacy_calls += 1;
+                    continue;
+                }
                 entry.calls += 1;
                 for (key, value) in &record.canonical_subset {
                     entry
@@ -137,39 +160,35 @@ pub fn suggest(records: &[CallRecord], config: &Config) -> LearnOutput {
     let proposals: Vec<Proposal> = seen
         .into_iter()
         .map(|(sig, obs)| Proposal {
-            args: matchers_for(&obs),
-            sig,
+            args: matchers_for(&sig, &obs),
             calls: obs.calls,
+            legacy_calls: obs.legacy_calls,
+            sig,
         })
         .collect();
 
     // Сниппеты собираются СЕРИАЛИЗАТОРАМИ, а не склейкой строк: даже после
     // whitelist-фильтра выше генерация текста из недоверенных имён обязана
     // идти через экранирование (тот же принцип, что в `import`).
-    // Каждое правило сериализуется ОТДЕЛЬНЫМ документом и уже потом
-    // склеивается. Иначе toml выносит все под-таблицы `args` в конец, и
-    // матчер оказывается визуально оторван от своего правила — а инструкция
-    // пользователю звучит «вычеркни лишнее»: удалив блок выше, он молча
-    // переприкрепил бы сужение к чужому правилу.
+    // Правило целиком помещается в ОДИН блок: таблица `args` пишется
+    // inline-таблицей, а не отдельной стансой `[policy.allow.args.path]`.
+    //
+    // Раньше сериализатор выносил её в конец, визуально отрывая от `sig`, —
+    // и инструкция «вычеркни лишнее», которую печатает эта же команда,
+    // становилась ловушкой: удаление стансы тихо превращало сужение в
+    // разрешение, а удаление соседнего правила переклеивало матчер на чужое
+    // (P1 ревью M3, воспроизведено с ответом `Config OK`).
     let toml_snippet = proposals
         .iter()
         .map(|p| {
-            let doc = AllowDoc {
-                policy: PolicyDoc {
-                    allow: vec![RuleConfig {
-                        sig: p.sig.clone(),
-                        args: p.args.clone(),
-                        deny_extra_args: false,
-                    }],
-                },
-            };
-            toml::to_string_pretty(&doc).unwrap_or_default()
+            render_rule(&RuleConfig {
+                sig: p.sig.clone(),
+                args: p.args.clone(),
+                deny_extra_args: false,
+            })
         })
         .collect::<Vec<_>>()
-        .join(
-            "
-",
-        );
+        .join("\n");
 
     let client_allow_snippet = if proposals.is_empty() {
         String::new()
@@ -199,7 +218,10 @@ pub fn suggest(records: &[CallRecord], config: &Config) -> LearnOutput {
 /// `None` означает «сузить нечем» — предлагаем обычное tool-level правило.
 /// Это нормальный исход: у половины инструментов аргументы вообще не
 /// идентифицируют ресурс.
-fn matchers_for(obs: &Observations) -> Option<BTreeMap<String, ArgMatcher>> {
+fn matchers_for(sig: &str, obs: &Observations) -> Option<BTreeMap<String, ArgMatcher>> {
+    if obs.calls == 0 {
+        return None;
+    }
     let mut matchers = BTreeMap::new();
     for (key, values) in &obs.values {
         // Ключ, встреченный не во всех вызовах, требовать нельзя: матчер
@@ -214,17 +236,35 @@ fn matchers_for(obs: &Observations) -> Option<BTreeMap<String, ArgMatcher>> {
         if values.iter().any(|v| !is_safe_value(v)) {
             continue;
         }
-        if let Some(matcher) = matcher_for_values(values) {
+        if let Some(matcher) = matcher_for_values(sig, key, values) {
             matchers.insert(key.clone(), matcher);
         }
     }
     (!matchers.is_empty()).then_some(matchers)
 }
 
-fn matcher_for_values(values: &BTreeSet<String>) -> Option<ArgMatcher> {
-    // Усечённый путь в журнале описывает не значение, а границу: правилом он
-    // становится префиксом. Смешивать усечённые и целые значения в один
-    // any_of нельзя — получится список, который не совпадёт ни с чем.
+/// Минимальная глубина префикса, ниже которой правило перестаёт быть
+/// сужением: один компонент — это почти корень диска.
+const MIN_PREFIX_COMPONENTS: usize = 2;
+
+/// Слишком широкая граница, чтобы называть её сужением.
+///
+/// `C:/Users/<user>` и `/home/<user>` — весь профиль целиком, вместе с
+/// `.ssh`, `.aws` и `.claude.json` (в последнем лежат токены всех MCP-
+/// серверов). Предлагать такое, подписав «сужено», хуже, чем не предлагать
+/// ничего: пользователь принимает решение по нашей подписи (P1 ревью M3).
+fn is_too_broad(resolved: &pathish::Resolved) -> bool {
+    if resolved.components.len() < MIN_PREFIX_COMPONENTS {
+        return true;
+    }
+    let first = resolved.components[0].to_lowercase();
+    resolved.components.len() == 2 && matches!(first.as_str(), "users" | "home")
+}
+
+fn matcher_for_values(sig: &str, key: &str, values: &BTreeSet<String>) -> Option<ArgMatcher> {
+    // Усечённый путь описывает не значение, а границу. Смешивать усечённые и
+    // целые значения в один any_of нельзя — получится список, который не
+    // совпадёт ни с чем.
     let truncated: Vec<&String> = values
         .iter()
         .filter(|v| v.ends_with(TRUNCATION_MARK))
@@ -234,13 +274,41 @@ fn matcher_for_values(values: &BTreeSet<String>) -> Option<ArgMatcher> {
             return None;
         }
         let stem = truncated[0].trim_end_matches(TRUNCATION_MARK);
-        return (!stem.is_empty()).then(|| {
-            ArgMatcher::Prefix(PrefixMatcher {
-                prefix: stem.to_string(),
-            })
-        });
+        let resolved = pathish::resolve(stem)?;
+        if is_too_broad(&resolved) {
+            // Наблюдений хватило только на слишком широкую границу. Честнее
+            // не сузить вовсе, чем выдать за сужение доступ ко всему профилю.
+            return None;
+        }
+        return Some(ArgMatcher::Prefix(PrefixMatcher {
+            prefix: stem.to_string(),
+        }));
     }
 
+    // Значение, которое канонизация МОГЛА исказить, точным матчером
+    // выражать нельзя: `exact` сравнивает побайтово, а в журнале лежит уже
+    // переписанное значение — `C:\work\zastava` записан как `C:/work/zastava`,
+    // URL обрезан до хоста. Такое правило не совпало бы даже с тем вызовом,
+    // из которого выведено (P1 ревью M3: пользователь включает enforce и его
+    // работа встаёт с «denied ... default deny»).
+    //
+    // Префиксный матчер сравнивает компоненты пути и разделители складывает,
+    // поэтому переживает и обратные слеши, и обрезанный хвост URL.
+    if is_lossy_key(key, values) {
+        if values.len() != 1 {
+            return None;
+        }
+        let value = values.iter().next()?;
+        let resolved = pathish::resolve(value)?;
+        if canon::is_pathish_key(key) && is_too_broad(&resolved) {
+            return None;
+        }
+        return Some(ArgMatcher::Prefix(PrefixMatcher {
+            prefix: value.clone(),
+        }));
+    }
+
+    let _ = sig;
     match values.len() {
         0 => None,
         1 => Some(ArgMatcher::Exact(
@@ -252,22 +320,57 @@ fn matcher_for_values(values: &BTreeSet<String>) -> Option<ArgMatcher> {
     }
 }
 
+/// Могла ли канонизация изменить значение так, что побайтовое сравнение с
+/// сырым аргументом больше не сработает.
+fn is_lossy_key(key: &str, values: &BTreeSet<String>) -> bool {
+    canon::is_pathish_key(key) || values.iter().any(|v| v.contains("://"))
+}
+
 /// Значение из журнала попадает в текст, который пользователь вставит в
 /// конфиг. Канонизация уже отсекла управляющие символы на записи, но журнал —
 /// обычный файл, и доверять его содержимому на чтении мы не обязаны.
 fn is_safe_value(value: &str) -> bool {
-    !value.is_empty() && value.len() <= 200 && !value.chars().any(|c| c.is_control())
+    // `is_control()` — это категория Cc, а U+2028/U+2029 в неё не входят,
+    // хотя терминалы и редакторы рисуют их переносом строки: отчёт `learn`
+    // визуально распадался бы на строки, которых в нём нет.
+    !value.is_empty()
+        && value.len() <= 200
+        && !value
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}' | '\u{0085}'))
 }
 
-/// Обёртки для сериализации TOML-сниппета.
-#[derive(serde::Serialize)]
-struct AllowDoc {
-    policy: PolicyDoc,
-}
+/// Печатает одно правило одним самодостаточным блоком TOML.
+///
+/// Текст собирается СЕРИАЛИЗАТОРОМ: имена инструментов и значения аргументов
+/// приходят от недоверенной стороны, и склейка строк здесь уже приводила к
+/// дописыванию чужих правил в конфиг пользователя.
+fn render_rule(rule: &RuleConfig) -> String {
+    let mut table = match toml_edit::ser::to_document(rule) {
+        Ok(doc) => doc.as_table().clone(),
+        Err(_) => return String::new(),
+    };
+    // `args` из отдельной стансы превращается в inline-таблицу, чтобы жить
+    // на одной строке со своим правилом.
+    if let Some(args) = table.remove("args") {
+        if let Some(args_table) = args
+            .into_table()
+            .ok()
+            .map(toml_edit::Table::into_inline_table)
+        {
+            table.insert("args", toml_edit::Item::Value(args_table.into()));
+        }
+    }
+    let mut array = toml_edit::ArrayOfTables::new();
+    table.set_implicit(false);
+    array.push(table);
 
-#[derive(serde::Serialize)]
-struct PolicyDoc {
-    allow: Vec<RuleConfig>,
+    let mut doc = toml_edit::DocumentMut::new();
+    let mut policy = toml_edit::Table::new();
+    policy.set_implicit(true);
+    policy.insert("allow", toml_edit::Item::ArrayOfTables(array));
+    doc.insert("policy", toml_edit::Item::Table(policy));
+    doc.to_string()
 }
 
 #[cfg(test)]
@@ -281,8 +384,18 @@ mod tests {
             server: server.into(),
             tool: tool.into(),
             decision: "deny".into(),
+            canon_version: CANON_VERSION,
             ..Default::default()
         }
+    }
+
+    /// Запись, сделанная прошлой версией заставы: `canonical_subset` пуст
+    /// по построению, а не потому что аргументов не было.
+    fn legacy_record(server: &str, tool: &str) -> CallRecord {
+        let mut r = record(server, tool);
+        r.canon_version = 0;
+        r.canonical_subset.clear();
+        r
     }
 
     fn with_subset(server: &str, tool: &str, pairs: &[(&str, &str)]) -> CallRecord {
@@ -368,14 +481,18 @@ mod tests {
         // усечённый путь, а правило обязано совпасть с сырым аргументом.
         let config = cfg("[servers.fs]\ncommand = \"x\"\n");
         let out = suggest(
-            &[with_subset("fs", "read", &[("path", "C:/work/zastava/…")])],
+            &[with_subset(
+                "fs",
+                "read",
+                &[("path", "C:/work/zastava/src/…")],
+            )],
             &config,
         );
         let matcher = out.proposals[0].args.as_ref().unwrap()["path"].clone();
         assert_eq!(
             matcher,
             ArgMatcher::Prefix(PrefixMatcher {
-                prefix: "C:/work/zastava".into()
+                prefix: "C:/work/zastava/src".into()
             })
         );
         assert!(
@@ -397,6 +514,127 @@ mod tests {
             !out.proposals[0].is_narrowed(),
             "необязательный ключ не должен становиться требованием"
         );
+    }
+
+    #[test]
+    fn legacy_records_do_not_silently_cancel_narrowing() {
+        // Находка ревью M3: одна запись до-M3 (пустой canonical_subset по
+        // построению) делала ключ «встреченным не во всех вызовах», и сужение
+        // молча исчезало у КАЖДОГО, кто обновится с M1/M2.
+        let conf = cfg("[servers.github]\ncommand = \"x\"\n");
+        let records = vec![
+            with_subset("github", "create_issue", &[("repo", "me/zastava")]),
+            with_subset("github", "create_issue", &[("repo", "me/zastava")]),
+            legacy_record("github", "create_issue"),
+        ];
+        let out = suggest(&records, &conf);
+        let proposal = &out.proposals[0];
+        assert!(
+            proposal.is_narrowed(),
+            "старая запись не должна отменять сужение: {proposal:?}"
+        );
+        assert_eq!(
+            proposal.calls, 2,
+            "считаются только наблюдения текущей версии"
+        );
+        assert_eq!(
+            proposal.legacy_calls, 1,
+            "но об остальных надо сказать честно"
+        );
+    }
+
+    #[test]
+    fn pseudo_tools_of_the_audit_are_not_proposed_as_rules() {
+        // Чтение ресурса и получение промпта пишутся в журнал псевдо-именами,
+        // но инструментами не являются и политикой не оцениваются.
+        let conf = cfg("[servers.rich]\ncommand = \"x\"\n");
+        let mut resource = record("rich", "zastava.resource");
+        resource.decision = "ungated".into();
+        let out = suggest(&[resource, record("rich", "real_tool")], &conf);
+        assert_eq!(out.sigs(), vec!["rich__real_tool"]);
+    }
+
+    #[test]
+    fn lossy_values_never_become_exact_matchers() {
+        // P1 ревью M3: канонизация переписывает значение (windows-разделители,
+        // URL до хоста), а `exact` сравнивает побайтово — правило не совпадало
+        // даже с тем вызовом, из которого выведено, и работа пользователя
+        // вставала с «denied ... default deny» сразу после включения enforce.
+        let conf = cfg("[servers.s]\ncommand = \"x\"\n");
+
+        let url = suggest(
+            &[with_subset(
+                "s",
+                "fetch",
+                &[("url", "https://api.example.com")],
+            )],
+            &conf,
+        );
+        let url_matcher = url.proposals[0].args.as_ref().unwrap()["url"].clone();
+        assert!(
+            url_matcher.matches(&serde_json::json!(
+                "https://api.example.com/v1/users?page=2"
+            )),
+            "правило обязано совпадать с реальным вызовом: {url_matcher:?}"
+        );
+        assert!(!url_matcher.matches(&serde_json::json!("https://evil.example.com/v1")));
+
+        // Короткий путь: канонизация заменила '\' на '/', и точное сравнение
+        // с сырым windows-аргументом не сработало бы.
+        let short = suggest(
+            &[with_subset("s", "read", &[("path", "C:/work/zastava")])],
+            &conf,
+        );
+        let path_matcher = short.proposals[0].args.as_ref().unwrap()["path"].clone();
+        assert!(path_matcher.matches(&serde_json::json!(r"C:\work\zastava\src\main.rs")));
+        assert!(!path_matcher.matches(&serde_json::json!(r"C:\work\zastava-private\x")));
+    }
+
+    #[test]
+    fn a_prefix_covering_the_whole_user_profile_is_not_called_narrowing() {
+        let conf = cfg("[servers.fs]\ncommand = \"x\"\n");
+        for value in ["C:/Users/alice/…", "/home/alice/…", "C:/…"] {
+            let out = suggest(&[with_subset("fs", "read", &[("path", value)])], &conf);
+            assert!(
+                !out.proposals[0].is_narrowed(),
+                "{value} — это не сужение, а весь профиль: {:?}",
+                out.proposals[0].args
+            );
+        }
+    }
+
+    #[test]
+    fn a_rule_stays_in_one_block_so_striking_out_cannot_reattach_it() {
+        // P1 ревью M3: таблица args уезжала отдельной стансой в конец, и
+        // инструкция «вычеркни лишнее», которую печатает эта же команда,
+        // превращалась в ловушку.
+        let conf = cfg("[servers.fs]\ncommand = \"x\"\n");
+        let out = suggest(
+            &[
+                with_subset("fs", "read", &[("path", "C:/work/zastava/src/…")]),
+                record("fs", "list"),
+            ],
+            &conf,
+        );
+        assert!(
+            !out.toml_snippet.contains("[policy.allow.args"),
+            "матчер обязан жить inline в своём правиле:\n{}",
+            out.toml_snippet
+        );
+
+        // Вычёркиваем блок целиком — оставшееся обязано остаться валидным и
+        // НЕ получить чужой матчер.
+        let blocks: Vec<&str> = out
+            .toml_snippet
+            .split("[[policy.allow]]")
+            .filter(|b| !b.trim().is_empty())
+            .collect();
+        assert_eq!(blocks.len(), 2, "{}", out.toml_snippet);
+        for block in blocks {
+            let merged = format!("[servers.fs]\ncommand = \"x\"\n[[policy.allow]]{block}");
+            let parsed = cfg(&merged);
+            assert_eq!(parsed.policy.allow.len(), 1);
+        }
     }
 
     #[test]

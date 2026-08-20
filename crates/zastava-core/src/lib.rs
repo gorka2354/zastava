@@ -11,6 +11,7 @@ pub mod canon;
 pub mod config;
 pub mod error;
 pub mod learn;
+pub mod pathish;
 pub mod policy;
 pub mod record;
 pub mod signature;
