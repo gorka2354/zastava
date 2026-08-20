@@ -317,6 +317,12 @@ fn events(path: &Path, limit: usize, denied_only: bool) -> anyhow::Result<()> {
         } else {
             "-".to_string()
         };
+        // Причина, если она есть: без неё «вызов не прошёл» в списке событий
+        // выглядит одинаково для таймаута, отмены и смерти сервера.
+        let what = match &record.reason {
+            Some(reason) => format!("{what}  ({reason})"),
+            None => what,
+        };
         println!(
             "{:<24} {:<20} {:<10} {}",
             record.id,

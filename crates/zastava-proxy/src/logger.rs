@@ -11,38 +11,86 @@ use std::fs::OpenOptions;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use tokio::sync::mpsc;
+
 use zastava_core::CallRecord;
 
 /// Дефолтный потолок размера журнала до ротации (50 МБ).
 pub const DEFAULT_MAX_LOG_BYTES: u64 = 50 * 1024 * 1024;
 
+/// Ёмкость очереди журнала.
+///
+/// Очередь ОГРАНИЧЕНА, и это не тюнинг, а защита. Писатель открывает файл на
+/// каждую запись и успевает ~2-4 тыс. строк/с, а источник событий — например,
+/// downstream, льющий уведомления, — выдаёт втрое больше. С неограниченным
+/// каналом разница оседала в памяти: верификация M2-full намерила +29 МБ за
+/// пять секунд и рост без потолка. Гейтвей, падающий по OOM, — это отказ в
+/// обслуживании, устроенный одним недоверенным сервером.
+const LOG_QUEUE_CAPACITY: usize = 8192;
+
 /// Хендл журнала: дёшево клонируется, отправка не блокирует.
 #[derive(Clone)]
 pub struct LogHandle {
-    tx: mpsc::UnboundedSender<CallRecord>,
+    tx: mpsc::Sender<CallRecord>,
+    /// Сколько записей потеряно из-за переполнения очереди. Считается здесь,
+    /// а не в писателе, потому что теряются они именно на отправке.
+    dropped: Arc<AtomicU64>,
 }
 
 impl LogHandle {
     /// Отправляет запись в журнал (fire-and-forget).
+    ///
+    /// Никогда не блокирует вызывающего: журнал не имеет права тормозить
+    /// работу агента. Если очередь переполнена, запись теряется, но НЕ молча —
+    /// потери считаются и попадают в журнал отдельным маркером, когда он
+    /// разгребётся. Тихая потеря записей в аудит-инструменте недопустима.
     pub fn write(&self, record: CallRecord) {
-        if self.tx.send(record).is_err() {
-            tracing::warn!("log writer is gone; call record dropped");
+        match self.tx.try_send(record) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                tracing::warn!("log writer is gone; call record dropped");
+            }
         }
     }
 }
 
 /// Запускает writer-таску журнала. Возвращает хендл для отправки записей.
 pub fn start(path: PathBuf, max_bytes: u64) -> LogHandle {
-    let (tx, mut rx) = mpsc::unbounded_channel::<CallRecord>();
+    let (tx, mut rx) = mpsc::channel::<CallRecord>(LOG_QUEUE_CAPACITY);
+    let dropped = Arc::new(AtomicU64::new(0));
+    let writer_dropped = dropped.clone();
     tokio::task::spawn_blocking(move || {
+        let mut reported = 0u64;
         while let Some(record) = rx.blocking_recv() {
+            // Разгребли очередь — сообщаем о потерях. Момент выбран потому,
+            // что раньше писать бессмысленно: маркер сам встал бы в очередь.
+            let lost = writer_dropped.load(Ordering::Relaxed);
+            if lost > reported {
+                let marker = CallRecord::marker(
+                    crate::util::now_rfc3339(),
+                    crate::util::next_event_id(),
+                    "journal_overflow",
+                    Some(format!(
+                        "{} записей потеряно из-за переполнения очереди",
+                        lost - reported
+                    )),
+                );
+                reported = lost;
+                if let Err(e) = append_line(&path, max_bytes, &marker.to_jsonl()) {
+                    tracing::warn!(error = %e, "could not record journal overflow");
+                }
+            }
             if let Err(e) = append_line(&path, max_bytes, &record.to_jsonl()) {
                 tracing::warn!(error = %e, path = %path.display(), "log write failed (call not blocked)");
             }
         }
     });
-    LogHandle { tx }
+    LogHandle { tx, dropped }
 }
 
 fn append_line(path: &Path, max_bytes: u64, line: &str) -> std::io::Result<()> {

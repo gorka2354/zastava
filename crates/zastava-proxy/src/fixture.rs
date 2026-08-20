@@ -328,18 +328,44 @@ impl rmcp::ServerHandler for ProgressFixture {
         _request: Option<rmcp::model::PaginatedRequestParams>,
         _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
     ) -> Result<rmcp::model::ListToolsResult, rmcp::model::ErrorData> {
-        Ok(
-            rmcp::model::ListToolsResult::with_all_items(vec![stub_tool("work")])
-                .with_ttl_ms(0)
-                .with_cache_scope(rmcp::model::CacheScope::Private),
-        )
+        Ok(rmcp::model::ListToolsResult::with_all_items(vec![
+            stub_tool("work"),
+            stub_tool("tick"),
+            stub_tool("silent"),
+        ])
+        .with_ttl_ms(0)
+        .with_cache_scope(rmcp::model::CacheScope::Private))
     }
 
     async fn call_tool(
         &self,
-        _request: rmcp::model::CallToolRequestParams,
+        request: rmcp::model::CallToolRequestParams,
         context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
     ) -> Result<rmcp::model::CallToolResponse, rmcp::model::ErrorData> {
+        // `tick` работает долго и всё это время отчитывается: нужен, чтобы
+        // проверить продление таймаута. `silent` работает столько же, но
+        // молчит — он обязан быть оборван.
+        if request.name.as_ref() == "tick" || request.name.as_ref() == "silent" {
+            let talks = request.name.as_ref() == "tick";
+            let token = context.meta.get_progress_token();
+            for step in 1..=20u32 {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                if !talks {
+                    continue;
+                }
+                if let Some(token) = &token {
+                    let param =
+                        rmcp::model::ProgressNotificationParam::new(token.clone(), step as f64);
+                    let _ = context.peer.notify_progress(param).await;
+                }
+            }
+            let mut result =
+                rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(
+                    "finished",
+                )]);
+            result.result_type = Some(rmcp::model::ResultType::COMPLETE);
+            return Ok(rmcp::model::CallToolResponse::Complete(result));
+        }
         if let Some(token) = context.meta.get_progress_token() {
             for step in 1..=3u32 {
                 let param = rmcp::model::ProgressNotificationParam::new(token.clone(), step as f64)

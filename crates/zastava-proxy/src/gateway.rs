@@ -192,6 +192,9 @@ const MAX_LIST_PAGES: usize = 50;
 const RESOURCE_PSEUDO_TOOL: &str = "zastava.resource";
 const PROMPT_PSEUDO_TOOL: &str = "zastava.prompt.";
 const MAX_TOOLS_PER_SERVER: usize = 2_000;
+/// Во сколько раз прогресс может продлить ожидание сверх базового бюджета.
+/// Потолок нужен, потому что источник продления — недоверенный downstream.
+const MAX_PROGRESS_EXTENSIONS: u32 = 10;
 
 impl Gateway {
     /// Собирает гейтвей. `passthrough` отключает политику (но НЕ журнал —
@@ -244,7 +247,17 @@ impl Gateway {
 
     /// Обновляет карту «URI ресурса → сервер», опрашивая downstream'ы.
     async fn refresh_resource_owners(&self) -> Vec<Resource> {
-        let per_server = self.downstreams.iter().map(|(name, ds)| async move {
+        // Порядок обхода ДЕТЕРМИНИРОВАННЫЙ — по имени сервера.
+        //
+        // Правило «первый объявивший URI им и владеет» само по себе разумно,
+        // но обход `HashMap` рандомизирован, и «первый» получался подбросом
+        // монеты: верификация M2-full намерила, что враждебный сервер,
+        // объявивший чужой URI, перехватывал чтения в 17 случаях из 40. При
+        // сортировке победитель всегда один и тот же, а конфликт видно в
+        // аудите.
+        let mut ordered: Vec<_> = self.downstreams.iter().collect();
+        ordered.sort_by_key(|(name, _)| (*name).clone());
+        let per_server = ordered.into_iter().map(|(name, ds)| async move {
             let listed = tokio::time::timeout(self.list_timeout, ds.list_all_resources()).await;
             (name.clone(), listed)
         });
@@ -268,6 +281,11 @@ impl Gateway {
                                     duplicate = %name,
                                     "resource URI claimed by two servers; keeping the first"
                                 );
+                                // Два сервера на один URI — это либо ошибка
+                                // настройки, либо попытка перехватить чужой
+                                // ресурс. И то и другое человек должен
+                                // увидеть, а не искать в stderr.
+                                self.mark_uri_conflict(taken.get(), &name, &resource.uri);
                             }
                         }
                     }
@@ -387,17 +405,37 @@ impl Gateway {
         });
     }
 
+    /// Пишет в аудит конфликт владения URI ресурса.
+    fn mark_uri_conflict(&self, owner: &str, duplicate: &str, uri: &str) {
+        let Some(log) = &self.log else { return };
+        let (owner, o_dirty) = sanitize_name(owner);
+        let (duplicate, d_dirty) = sanitize_name(duplicate);
+        let (uri, u_dirty) = sanitize_name(uri);
+        let mut record = CallRecord::marker(
+            now_rfc3339(),
+            next_event_id(),
+            "resource_uri_conflict",
+            Some(format!(
+                "{uri}: принадлежит {owner}, заявлен также {duplicate}"
+            )),
+        );
+        record.name_sanitized = o_dirty || d_dirty || u_dirty;
+        log.write(record);
+    }
+
     /// Пишет в аудит, что сервер выпал из выдачи.
     fn mark_unreachable(&self, server: &str, detail: &str) {
         let Some(log) = &self.log else { return };
-        let (server, dirty) = sanitize_name(server);
+        let (server, s_dirty) = sanitize_name(server);
+        // `detail` содержит сообщение об ошибке ОТ СЕРВЕРА — экранируем и его.
+        let (detail, d_dirty) = sanitize_name(detail);
         let mut record = CallRecord::marker(
             now_rfc3339(),
             next_event_id(),
             "downstream_unreachable",
             Some(format!("{server}: {detail}")),
         );
-        record.name_sanitized = dirty;
+        record.name_sanitized = s_dirty || d_dirty;
         log.write(record);
     }
 
@@ -692,7 +730,18 @@ impl ServerHandler for Gateway {
                 // отчитывается, не должна обрываться по общему бюджету, а
                 // замолчавшая — должна.
                 let stop = {
-                    let mut deadline = tokio::time::Instant::now() + self.call_timeout;
+                    let started_waiting = tokio::time::Instant::now();
+                    // Абсолютный потолок ожидания. Продление привязано к паре
+                    // (сервер, токен), но ТОКЕН В УВЕДОМЛЕНИИ ВЫБИРАЕТ САМ
+                    // СЕРВЕР: враждебному downstream'у достаточно одного
+                    // жертвенного вызова, поливающего прогрессом токены своих
+                    // же соседних вызовов, чтобы держать их вечно —
+                    // верификация M2-full удержала вызов 4.6 с при бюджете
+                    // 300 мс. Продление отвечает на вопрос «операция жива?»,
+                    // а не «можно ли ждать бесконечно».
+                    let hard_deadline =
+                        started_waiting + self.call_timeout * MAX_PROGRESS_EXTENSIONS;
+                    let mut deadline = started_waiting + self.call_timeout;
                     loop {
                         let tick = progress_tick.clone();
                         let progressed = async {
@@ -707,8 +756,10 @@ impl ServerHandler for Gateway {
                             biased;
                             _ = context.ct.cancelled() => break Stop::ClientCancelled,
                             _ = tokio::time::sleep_until(deadline) => break Stop::Timeout,
+                            _ = tokio::time::sleep_until(hard_deadline) => break Stop::Timeout,
                             _ = progressed => {
-                                deadline = tokio::time::Instant::now() + self.call_timeout;
+                                deadline = (tokio::time::Instant::now() + self.call_timeout)
+                                    .min(hard_deadline);
                                 continue;
                             }
                             answered = &mut handle.rx => break match answered {
@@ -761,7 +812,8 @@ impl ServerHandler for Gateway {
                     tool,
                     &args,
                     decision.as_ref(),
-                    CallOutcome::failed(duration_ms).because(format!("unreachable: {e}")),
+                    CallOutcome::failed(duration_ms)
+                        .because(sanitize_name(&format!("unreachable: {e}")).0),
                 );
                 return Ok(Self::tool_error(format!(
                     "could not reach downstream '{server}': {e}; the call did not happen"

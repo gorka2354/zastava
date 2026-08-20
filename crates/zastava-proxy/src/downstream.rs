@@ -400,12 +400,92 @@ impl ListChangedHub {
     }
 }
 
+/// Пишет в журнал СВОДКУ за окно вместо записи на каждое событие.
+///
+/// Появился потому, что одно и то же лечение понадобилось дважды. Сперва
+/// шквалом `list_changed` недоверенный сервер вымывал ротацией весь аудит;
+/// это закрыли схлопыванием — и той же волной открыли заново через
+/// `reverse_request_refused`, который писал запись на КАЖДЫЙ обратный запрос
+/// (верификация M2-full: 13 тыс. запросов/с, 1.4 МБ/с журнала, вся история
+/// стиралась за три с половиной минуты).
+///
+/// Общий тип, чтобы третьего раза не было: любое событие, частоту которого
+/// задаёт downstream, обязано идти через него.
+#[derive(Clone)]
+pub struct SummaryLog {
+    event: &'static str,
+    log: Option<LogHandle>,
+    state: Arc<Mutex<SummaryState>>,
+}
+
+#[derive(Default)]
+struct SummaryState {
+    scheduled: bool,
+    /// Ключ → сколько раз за окно. Ключ строит вызывающий (обычно
+    /// «сервер: что просил»), поэтому атрибуция не теряется.
+    seen: HashMap<String, u64>,
+}
+
+impl SummaryLog {
+    /// Сводка событий `event` в журнал `log`.
+    pub fn new(event: &'static str, log: Option<LogHandle>) -> Self {
+        Self {
+            event,
+            log,
+            state: Arc::new(Mutex::new(SummaryState::default())),
+        }
+    }
+
+    /// Учитывает событие. Запись появится одной сводкой по окончании окна.
+    pub fn record(&self, key: String) {
+        if self.log.is_none() {
+            return;
+        }
+        {
+            let mut state = self.state.lock().expect("summary lock poisoned");
+            *state.seen.entry(key).or_insert(0) += 1;
+            if state.scheduled {
+                return;
+            }
+            state.scheduled = true;
+        }
+
+        let this = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(SUMMARY_WINDOW).await;
+            let seen = {
+                let mut state = this.state.lock().expect("summary lock poisoned");
+                state.scheduled = false;
+                std::mem::take(&mut state.seen)
+            };
+            let Some(log) = &this.log else { return };
+            let mut parts: Vec<String> = seen.iter().map(|(k, n)| format!("{k}×{n}")).collect();
+            parts.sort();
+            log.write(CallRecord::marker(
+                now_rfc3339(),
+                next_event_id(),
+                this.event,
+                Some(parts.join(", ")),
+            ));
+        });
+    }
+}
+
+impl std::fmt::Debug for SummaryLog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SummaryLog")
+    }
+}
+
+/// Окно схлопывания для сводок в журнал.
+const SUMMARY_WINDOW: Duration = Duration::from_millis(500);
+
 /// Всё общее, что downstream-обработчик получает от гейтвея.
 ///
 /// Отдельный тип, потому что этих связей стало четыре и они одинаковы для
 /// всех downstream'ов: тащить их россыпью через `spawn_downstream` значило бы
 /// менять сигнатуру при каждом новом мосте.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct Shared {
     /// Пир настоящего клиента; заполняется после его подключения.
     pub upstream: UpstreamSlot,
@@ -415,6 +495,21 @@ pub struct Shared {
     pub lists: ListChangedHub,
     /// Журнал: отказ downstream'у — тоже событие аудита.
     pub log: Option<LogHandle>,
+    /// Сводка отказов обратным запросам. Частоту этих событий задаёт
+    /// downstream, поэтому запись на каждое — готовый способ вымыть аудит.
+    pub refusals: SummaryLog,
+}
+
+impl Default for Shared {
+    fn default() -> Self {
+        Self {
+            upstream: UpstreamSlot::default(),
+            progress: ProgressBridge::default(),
+            lists: ListChangedHub::default(),
+            log: None,
+            refusals: SummaryLog::new("reverse_request_refused", None),
+        }
+    }
 }
 
 /// Обработчик клиент-роли для одного downstream-сервера.
@@ -449,17 +544,12 @@ impl DownstreamHandler {
         // когда мы её отклонили. Иначе «сервер просил у меня доступ к корневым
         // каталогам» останется известным только stderr'у, который никто не
         // читает (находка ревью M2-full).
-        if let Some(log) = &self.shared.log {
-            let (server, dirty) = zastava_core::config::sanitize_name(&self.name);
-            let mut record = CallRecord::marker(
-                now_rfc3339(),
-                next_event_id(),
-                "reverse_request_refused",
-                Some(format!("{server}: {method}")),
-            );
-            record.name_sanitized = dirty;
-            log.write(record);
-        }
+        //
+        // Через СВОДКУ, а не записью на каждый запрос: частоту здесь задаёт
+        // downstream, и запись на каждую попытку — готовый способ вымыть
+        // ротацией весь аудит (находка верификации M2-full).
+        let (server, _) = zastava_core::config::sanitize_name(&self.name);
+        self.shared.refusals.record(format!("{server}: {method}"));
         // `ErrorData::method_not_found::<M>()` требует const-строку типом;
         // нам нужно имя метода в рантайме, поэтому собираем код руками.
         ErrorData::new(
@@ -659,6 +749,44 @@ mod tests {
         assert!(summary.contains("alpha×1"), "{summary}");
         assert!(summary.contains("beta×2"), "{summary}");
         assert!(summary.contains("tools"), "{summary}");
+    }
+
+    #[tokio::test]
+    async fn a_flood_of_refusals_collapses_into_one_summary() {
+        // Верификация M2-full: `reverse_request_refused` писался на КАЖДЫЙ
+        // обратный запрос, и враждебный сервер вымывал ротацией весь аудит за
+        // три с половиной минуты — ровно та атака, которую та же волна
+        // закрыла для list_changed.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("calls.jsonl");
+        let log = crate::logger::start(path.clone(), crate::logger::DEFAULT_MAX_LOG_BYTES);
+        let summary = SummaryLog::new("reverse_request_refused", Some(log));
+
+        for _ in 0..5_000 {
+            summary.record("evil: roots/list".to_string());
+        }
+        summary.record("evil: elicitation/create".to_string());
+        tokio::time::sleep(SUMMARY_WINDOW + Duration::from_millis(200)).await;
+
+        let records = crate::logger::read_records(&path).unwrap_or_default();
+        let refusals: Vec<&CallRecord> = records
+            .iter()
+            .filter(|r| r.tool == "reverse_request_refused")
+            .collect();
+        assert!(
+            refusals.len() <= 2,
+            "5001 отказ обязан схлопнуться в сводку, а не в {} записей",
+            refusals.len()
+        );
+        let detail = refusals
+            .first()
+            .and_then(|r| r.matched_rule.clone())
+            .expect("сводка");
+        assert!(detail.contains("roots/list×5000"), "{detail}");
+        assert!(
+            detail.contains("elicitation/create×1"),
+            "второй метод тоже обязан быть назван: {detail}"
+        );
     }
 
     #[tokio::test]

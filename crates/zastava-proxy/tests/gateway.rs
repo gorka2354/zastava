@@ -1221,3 +1221,101 @@ impl rmcp::handler::client::ClientHandler for RecordingMessages {
             .push((params.progress_token, params.message.unwrap_or_default()));
     }
 }
+
+/// Поднимает гейтвей над одной progress-фикстурой с заданным бюджетом вызова.
+async fn progress_gateway(
+    call_timeout_ms: u64,
+) -> (
+    rmcp::service::RunningService<rmcp::service::RoleClient, ()>,
+    std::path::PathBuf,
+    tempfile::TempDir,
+) {
+    let bridge = zastava_proxy::downstream::ProgressBridge::new();
+    let (fixture_io, server_io) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        if let Ok(running) = ProgressFixture::new("p").serve(server_io).await {
+            let _ = running.waiting().await;
+        }
+    });
+    let ds = DownstreamHandler::new(
+        "p",
+        Shared {
+            progress: bridge.clone(),
+            ..Shared::default()
+        },
+    )
+    .serve(fixture_io)
+    .await
+    .expect("downstream");
+
+    let mut downstreams = HashMap::new();
+    downstreams.insert("p".to_string(), ds);
+
+    let log_dir = tempfile::tempdir().expect("tempdir");
+    let log_path = log_dir.path().join("calls.jsonl");
+    let log = logger::start(log_path.clone(), logger::DEFAULT_MAX_LOG_BYTES);
+
+    let config = Config::from_toml_str("[servers.p]\ncommand = \"unused\"\n").unwrap();
+    let gateway = Gateway::with_options(
+        downstreams,
+        Arc::new(RwLock::new(PolicyEngine::from_config(&config.policy))),
+        Some(log),
+        Duration::from_millis(call_timeout_ms),
+        Duration::from_millis(2_000),
+        GatewayOptions {
+            progress: bridge,
+            ..GatewayOptions::default()
+        },
+    );
+    let (client_io, gw_io) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        if let Ok(running) = gateway.serve(gw_io).await {
+            let _ = running.waiting().await;
+        }
+    });
+    let client = ().serve(client_io).await.expect("client");
+    (client, log_path, log_dir)
+}
+
+#[tokio::test]
+async fn a_call_that_keeps_reporting_progress_outlives_the_budget() {
+    // Заявленное поведение W2 сперва вообще отсутствовало: опции rmcp
+    // применяются только внутри await_response(), которого гейтвей не зовёт.
+    // Здесь проверяется, что продление работает НА САМОМ ДЕЛЕ: инструмент
+    // работает 2 секунды при бюджете 400 мс, отчитываясь каждые 100 мс.
+    let (client, _log, _dir) = progress_gateway(400).await;
+    let result = client
+        .call_tool(call("p__tick", serde_json::json!({})))
+        .await
+        .expect("вызов проходит");
+    assert!(
+        text_of(&result).contains("finished"),
+        "живая операция обязана дойти до конца: {:?}",
+        text_of(&result)
+    );
+}
+
+#[tokio::test]
+async fn a_call_that_goes_silent_is_still_cut_off() {
+    // Обратная сторона: продление отвечает на вопрос «операция жива?», а не
+    // «можно ли ждать вечно». Молчащий инструмент обязан быть оборван.
+    let (client, log_path, _dir) = progress_gateway(300).await;
+    let result = client
+        .call_tool(call("p__silent", serde_json::json!({})))
+        .await
+        .expect("гейтвей отвечает");
+    let text = text_of(&result);
+    assert!(
+        text.contains("stopped waiting"),
+        "молчащий вызов обязан быть оборван: {text}"
+    );
+
+    let records = wait_records(&log_path, 1).await;
+    let record = records.iter().find(|r| r.is_call()).expect("запись вызова");
+    assert!(record.abandoned, "вызов брошен, а не провалился");
+    assert_eq!(
+        record.reason.as_deref(),
+        Some("zastava call timeout"),
+        "причина обязана быть названа: таймаут и смерть сервера — разные факты"
+    );
+}

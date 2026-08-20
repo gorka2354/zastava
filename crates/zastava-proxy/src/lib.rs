@@ -75,6 +75,7 @@ pub async fn run(config: Config, options: RunOptions) -> Result<(), ProxyError> 
         progress: progress.clone(),
         lists,
         log: log.clone(),
+        refusals: downstream::SummaryLog::new("reverse_request_refused", log.clone()),
     };
 
     // Eager parallel spawn (T6.4): опоздавшие/упавшие не валят остальных.
@@ -140,12 +141,18 @@ pub async fn run(config: Config, options: RunOptions) -> Result<(), ProxyError> 
                 // инструменты просто молча исчезают из выдачи, и человек
                 // видит «инструмента нет», а не «сервер не поднялся».
                 if let Some(log) = &log {
-                    log.write(zastava_core::CallRecord::marker(
+                    // Текст ошибки приходит от процесса downstream'а — тот же
+                    // недоверенный источник, что имя и версия.
+                    let (detail, dirty) =
+                        zastava_core::config::sanitize_name(&format!("{name}: {e}"));
+                    let mut record = zastava_core::CallRecord::marker(
                         util::now_rfc3339(),
                         util::next_event_id(),
                         "downstream_failed",
-                        Some(format!("{name}: {e}")),
-                    ));
+                        Some(detail),
+                    );
+                    record.name_sanitized = dirty;
+                    log.write(record);
                 }
                 tracing::error!(server = %name, error = %e, "downstream failed to start");
             }
