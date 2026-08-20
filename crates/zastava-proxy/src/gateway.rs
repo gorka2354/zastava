@@ -580,13 +580,23 @@ impl ServerHandler for Gateway {
         let mut downstream_req = request;
         downstream_req.name = tool.to_string().into();
         let started = Instant::now();
-        // Таймаут отдаём rmcp и просим продлевать его, пока downstream шлёт
-        // прогресс: долгая, но живая операция не должна обрываться по общему
-        // бюджету. Свой `select!` ниже остаётся — он ловит отмену клиентом.
+        // Опции ПУСТЫЕ — и это осознанно.
+        //
+        // `with_timeout(..).reset_timeout_on_progress()` выглядит ровно тем,
+        // что нужно, но rmcp применяет эти опции ТОЛЬКО внутри
+        // `RequestHandle::await_response()`, а мы его не зовём: ждём ответа
+        // сами, потому что нам нужен общий `select!` с отменой от клиента.
+        // В итоге опции не заводили никакого таймера (продление прогрессом не
+        // работало вовсе), но заставляли rmcp класть запись в
+        // `progress_timeout_watchers`, которую снимает только `await_response`
+        // или `cancel` — на успешном ответе она оставалась навсегда,
+        // ~766 байт на вызов (замерено ревью M2-full).
+        //
+        // Продление таймаута прогрессом реализовано ниже своим циклом.
         let sent = ds
             .send_cancellable_request(
                 ClientRequest::CallToolRequest(CallToolRequest::new(downstream_req)),
-                PeerRequestOptions::with_timeout(self.call_timeout).reset_timeout_on_progress(),
+                PeerRequestOptions::no_options(),
             )
             .await;
 
@@ -614,13 +624,22 @@ impl ServerHandler for Gateway {
                 // Клиент прислал свой progress-токен только если сам просил
                 // прогресса. rmcp подставил вниз СВОЙ токен — связываем их на
                 // время вызова; страж снимет связь на любом выходе.
-                let _progress = context.meta.get_progress_token().map(|client_token| {
+                //
+                // Имя сервера в ключе обязательно: счётчик токенов у rmcp свой
+                // на каждого пира и начинается с нуля, поэтому у разных
+                // downstream'ов они систематически совпадают.
+                let registered = context.meta.get_progress_token().map(|client_token| {
                     self.progress.register(
+                        server,
                         handle.progress_token.clone(),
                         client_token,
                         context.peer.clone(),
                     )
                 });
+                let (_progress_guard, progress_tick) = match registered {
+                    Some((guard, tick)) => (Some(guard), Some(tick)),
+                    None => (None, None),
+                };
 
                 enum Stop {
                     Answered(Box<Result<ServerResult, ServiceError>>),
@@ -628,16 +647,39 @@ impl ServerHandler for Gateway {
                     ClientCancelled,
                     Died,
                 }
-                let stop = tokio::select! {
-                    biased;
-                    _ = context.ct.cancelled() => Stop::ClientCancelled,
-                    _ = tokio::time::sleep(self.call_timeout) => Stop::Timeout,
-                    answered = &mut handle.rx => match answered {
-                        Ok(result) => Stop::Answered(Box::new(result)),
-                        // Канал закрыт, а ответа не было: downstream исчез
-                        // посреди запроса. Запрос при этом уже ушёл к нему.
-                        Err(_) => Stop::Died,
-                    },
+
+                // Таймаут отсчитываем сами и ПРОДЛЕВАЕМ его на каждом
+                // уведомлении о прогрессе: операция, которая жива и
+                // отчитывается, не должна обрываться по общему бюджету, а
+                // замолчавшая — должна.
+                let stop = {
+                    let mut deadline = tokio::time::Instant::now() + self.call_timeout;
+                    loop {
+                        let tick = progress_tick.clone();
+                        let progressed = async {
+                            match tick {
+                                Some(tick) => tick.notified().await,
+                                // Клиент прогресса не просил — продлевать
+                                // нечем, ждём только дедлайна.
+                                None => std::future::pending().await,
+                            }
+                        };
+                        tokio::select! {
+                            biased;
+                            _ = context.ct.cancelled() => break Stop::ClientCancelled,
+                            _ = tokio::time::sleep_until(deadline) => break Stop::Timeout,
+                            _ = progressed => {
+                                deadline = tokio::time::Instant::now() + self.call_timeout;
+                                continue;
+                            }
+                            answered = &mut handle.rx => break match answered {
+                                Ok(result) => Stop::Answered(Box::new(result)),
+                                // Канал закрыт, а ответа не было: downstream
+                                // исчез посреди запроса. Запрос уже ушёл к нему.
+                                Err(_) => Stop::Died,
+                            },
+                        }
+                    }
                 };
                 match stop {
                     Stop::Answered(result) => Forwarded::Answered(result),

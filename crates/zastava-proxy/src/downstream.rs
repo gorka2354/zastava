@@ -105,12 +105,27 @@ impl UpstreamSlot {
 /// нельзя. Downstream шлёт уведомления на свой токен, а клиент ждёт свой, и
 /// без перевода прогресс либо теряется, либо адресуется в пустоту.
 ///
-/// Заодно это граница доверия: downstream может прислать уведомление на ЧУЖОЙ
-/// токен (свой или выдуманный). Незарегистрированный токен просто не имеет
-/// соответствия и дальше не идёт — подделать чужой прогресс нельзя.
+/// **Ключ карты — ПАРА (сервер, токен), и это принципиально.** Счётчик
+/// progress-токенов у rmcp свой на каждого пира и начинается с нуля, поэтому
+/// n-й запрос к серверу A и n-й запрос к серверу B получают ОДИН И ТОТ ЖЕ
+/// токен. Пока ключом был только токен, происходило два разных зла (оба
+/// воспроизведены ревью M2-full):
+/// - без всякого умысла регистрации двух серверов затирали друг друга, прогресс
+///   уезжал в чужой вызов, а страж снимал чужую запись;
+/// - враждебный сервер, зная, что токены — маленькие предсказуемые целые, слал
+///   уведомления веером и вписывал СВОЙ текст в ход чужого вызова: клиент
+///   показывает `message` человеку, и получался канал обмана оператора.
 #[derive(Clone, Default)]
 pub struct ProgressBridge {
-    relays: Arc<Mutex<HashMap<ProgressToken, Relay>>>,
+    relays: Arc<Mutex<HashMap<RelayKey, Relay>>>,
+}
+
+/// Кто именно прислал токен. Без имени сервера токены разных downstream'ов
+/// систематически совпадают.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RelayKey {
+    server: String,
+    token: ProgressToken,
 }
 
 impl std::fmt::Debug for ProgressBridge {
@@ -124,6 +139,10 @@ impl std::fmt::Debug for ProgressBridge {
 struct Relay {
     client_token: ProgressToken,
     client: Peer<RoleServer>,
+    /// Будится на каждом переведённом уведомлении. Гейтвей ждёт этот сигнал,
+    /// чтобы продлить свой таймаут: операция, которая ЖИВА и отчитывается,
+    /// не должна обрываться по общему бюджету.
+    tick: Arc<tokio::sync::Notify>,
 }
 
 impl ProgressBridge {
@@ -134,36 +153,53 @@ impl ProgressBridge {
 
     /// Связывает токен downstream'а с токеном клиента на время вызова.
     ///
-    /// Возвращает страж: соответствие снимается на ЛЮБОМ выходе из вызова —
-    /// успех, ошибка, таймаут, отмена. Без этого карта росла бы вечно.
+    /// Возвращает страж (соответствие снимается на ЛЮБОМ выходе из вызова —
+    /// успех, ошибка, таймаут, отмена; без этого карта росла бы вечно) и
+    /// сигнал, который будится на каждом переведённом уведомлении.
     pub fn register(
         &self,
+        server: &str,
         downstream_token: ProgressToken,
         client_token: ProgressToken,
         client: Peer<RoleServer>,
-    ) -> ProgressGuard {
+    ) -> (ProgressGuard, Arc<tokio::sync::Notify>) {
+        let tick = Arc::new(tokio::sync::Notify::new());
+        let key = RelayKey {
+            server: server.to_string(),
+            token: downstream_token,
+        };
         self.relays.lock().expect("progress lock poisoned").insert(
-            downstream_token.clone(),
+            key.clone(),
             Relay {
                 client_token,
                 client,
+                tick: tick.clone(),
             },
         );
-        ProgressGuard {
-            bridge: self.clone(),
-            token: downstream_token,
-        }
+        (
+            ProgressGuard {
+                bridge: self.clone(),
+                key,
+            },
+            tick,
+        )
     }
 
     /// Переводит уведомление downstream'а клиенту. Молча игнорирует
-    /// незнакомый токен.
-    async fn relay(&self, mut params: ProgressNotificationParam) {
+    /// незнакомую пару (сервер, токен).
+    async fn relay(&self, server: &str, mut params: ProgressNotificationParam) {
+        let key = RelayKey {
+            server: server.to_string(),
+            token: params.progress_token.clone(),
+        };
         let relay = {
             let map = self.relays.lock().expect("progress lock poisoned");
-            map.get(&params.progress_token).cloned()
+            map.get(&key).cloned()
         };
         let Some(relay) = relay else { return };
         params.progress_token = relay.client_token;
+        // Сигналим ДО отправки: гейтвею важен сам факт «downstream жив».
+        relay.tick.notify_one();
         if let Err(e) = relay.client.notify_progress(params).await {
             tracing::debug!(error = %e, "could not relay progress to the client");
         }
@@ -173,7 +209,7 @@ impl ProgressBridge {
 /// Снимает соответствие токенов, когда вызов закончился.
 pub struct ProgressGuard {
     bridge: ProgressBridge,
-    token: ProgressToken,
+    key: RelayKey,
 }
 
 impl Drop for ProgressGuard {
@@ -182,7 +218,7 @@ impl Drop for ProgressGuard {
             .relays
             .lock()
             .expect("progress lock poisoned")
-            .remove(&self.token);
+            .remove(&self.key);
     }
 }
 
@@ -245,6 +281,10 @@ struct CategoryState {
     /// Уведомление уже запланировано — второе планировать не нужно.
     scheduled: bool,
     last_sent: Option<Instant>,
+    /// Кто и сколько раз сообщил за текущее окно. Копится в памяти ровно на
+    /// время окна и уходит в журнал одной сводкой: атрибуция сохраняется, а
+    /// стоимость перестаёт зависеть от щедрости downstream'а.
+    seen: HashMap<String, u64>,
 }
 
 impl std::fmt::Debug for ListChangedHub {
@@ -271,53 +311,76 @@ impl ListChangedHub {
     }
 
     /// Принимает уведомление от downstream'а `server`.
+    ///
+    /// Всё, что здесь делается, ограничено по частоте — и это не оптимизация,
+    /// а требование безопасности. Уведомление шлёт САМ СЕРВЕР: ни модель, ни
+    /// политика в этом не участвуют, стоит оно ~85 байт, а раньше каждое
+    /// порождало запись в журнале. Ревью M2-full воспроизвело: 76 725
+    /// уведомлений за 5 секунд — это ~4.4 МБ/с роста журнала, и вся история
+    /// (50 МБ × 6 поколений) вытиралась ротацией за минуту вместе с записями
+    /// о заблокированных вызовах. То есть недоверенный сервер бесплатно и
+    /// тихо уничтожал главный товар продукта.
+    ///
+    /// Атрибуцию при этом терять нельзя, поэтому в журнал уходит не каждое
+    /// уведомление, а СВОДКА за окно: «сервер X, категория Y, N уведомлений».
     pub fn notify(&self, server: &str, kind: ListKind) {
-        // В аудит пишем КАЖДОЕ входящее с именем источника, даже если наружу
-        // уйдёт одно: расследование не должно терять, кто именно менялся.
-        if let Some(log) = &self.inner.log {
-            log.write(CallRecord::marker(
-                now_rfc3339(),
-                next_event_id(),
-                "list_changed",
-                Some(format!("{server}: {}", kind.as_str())),
-            ));
-        }
+        let mut state = self.inner.state.lock().expect("hub lock poisoned");
+        let entry = state.entry(kind).or_default();
+        *entry.seen.entry(server.to_string()).or_insert(0) += 1;
 
-        if kind == ListKind::Resources {
-            // Карта владельцев построена на прошлом листинге и теперь может
-            // врать: чтение ушло бы к бывшему владельцу ресурса.
-            self.inner
-                .resource_owners
-                .write()
-                .expect("resource owners lock poisoned")
-                .clear();
+        if entry.scheduled {
+            // Окно уже открыто: и сводка, и сброс кеша, и уведомление наружу
+            // произойдут по его истечении — ровно по разу.
+            return;
         }
-
-        let delay = {
-            let mut state = self.inner.state.lock().expect("hub lock poisoned");
-            let entry = state.entry(kind).or_default();
-            if entry.scheduled {
-                return;
-            }
-            entry.scheduled = true;
-            // Пауза схлопывания плюс, если нужно, доводка до потолка частоты.
-            let since_last = entry
-                .last_sent
-                .map(|t| t.elapsed())
-                .unwrap_or(LIST_CHANGED_MIN_INTERVAL);
-            let cooldown = LIST_CHANGED_MIN_INTERVAL.saturating_sub(since_last);
-            LIST_CHANGED_DEBOUNCE.max(cooldown)
-        };
+        entry.scheduled = true;
+        let since_last = entry
+            .last_sent
+            .map(|t| t.elapsed())
+            .unwrap_or(LIST_CHANGED_MIN_INTERVAL);
+        let cooldown = LIST_CHANGED_MIN_INTERVAL.saturating_sub(since_last);
+        let delay = LIST_CHANGED_DEBOUNCE.max(cooldown);
+        drop(state);
 
         let inner = self.inner.clone();
         tokio::spawn(async move {
             tokio::time::sleep(delay).await;
-            {
+
+            let seen = {
                 let mut state = inner.state.lock().expect("hub lock poisoned");
                 let entry = state.entry(kind).or_default();
                 entry.scheduled = false;
                 entry.last_sent = Some(Instant::now());
+                std::mem::take(&mut entry.seen)
+            };
+
+            // Сводка: кто и сколько раз сообщил за окно. Одна запись вместо
+            // тысяч, но источники все названы.
+            if let Some(log) = &inner.log {
+                let mut sources: Vec<String> =
+                    seen.iter().map(|(s, n)| format!("{s}×{n}")).collect();
+                sources.sort();
+                log.write(CallRecord::marker(
+                    now_rfc3339(),
+                    next_event_id(),
+                    "list_changed",
+                    Some(format!("{}: {}", kind.as_str(), sources.join(", "))),
+                ));
             }
+
+            if kind == ListKind::Resources {
+                // Чистим ТОЛЬКО записи тех серверов, что сообщили об
+                // изменении. Полный `clear()` позволял одному downstream'у
+                // обнулить маршрутизацию чужих ресурсов и заставить гейтвей
+                // веерно перелистывать ВСЕХ на каждом последующем чтении
+                // (находка ревью M2-full).
+                let mut owners = inner
+                    .resource_owners
+                    .write()
+                    .expect("resource owners lock poisoned");
+                owners.retain(|_, owner| !seen.contains_key(owner));
+            }
+
             // Уведомление — «выстрелил и забыл»: если клиента ещё нет, ждать
             // ради него нечего, списки он и так запросит при подключении.
             let Some(client) = inner.upstream.try_get() else {
@@ -438,8 +501,9 @@ impl ClientHandler for DownstreamHandler {
         _context: NotificationContext<RoleClient>,
     ) {
         // Уведомление — не запрос: отвечать некому и ждать нечего. Просто
-        // переводим токен и отправляем дальше.
-        self.progress.relay(params).await;
+        // переводим токен и отправляем дальше. Имя сервера обязательно:
+        // без него токены разных downstream'ов сливаются в один ключ.
+        self.progress.relay(&self.name, params).await;
     }
 
     async fn on_tool_list_changed(&self, _context: NotificationContext<RoleClient>) {
@@ -459,72 +523,104 @@ impl ClientHandler for DownstreamHandler {
 mod tests {
     use super::*;
 
-    fn owners_with(uri: &str, server: &str) -> Arc<RwLock<HashMap<String, String>>> {
-        let map = Arc::new(RwLock::new(HashMap::new()));
-        map.write()
-            .unwrap()
-            .insert(uri.to_string(), server.to_string());
-        map
+    /// Ждёт, пока хаб отработает окно схлопывания.
+    async fn settle() {
+        tokio::time::sleep(LIST_CHANGED_DEBOUNCE + Duration::from_millis(150)).await;
     }
 
     #[tokio::test]
-    async fn resource_list_changed_drops_the_owner_cache() {
-        // Ресурсы маршрутизируются по карте «URI → сервер», построенной на
-        // прошлом листинге. Если downstream переставил свои ресурсы, карта
-        // врёт, и чтение уходит к БЫВШЕМУ владельцу.
-        let owners = owners_with("mem://note", "alpha");
+    async fn resource_list_changed_evicts_only_the_notifying_server() {
+        // Ресурсы маршрутизируются по карте «URI → сервер». Если downstream
+        // переставил свои ресурсы, его записи врут. Но чистить ВСЮ карту
+        // нельзя: тогда один сервер обнуляет маршрутизацию чужих ресурсов и
+        // заставляет гейтвей веерно перелистывать всех на каждом чтении
+        // (находка ревью M2-full).
+        let owners = Arc::new(RwLock::new(HashMap::new()));
+        {
+            let mut map = owners.write().unwrap();
+            map.insert("mem://alpha-note".to_string(), "alpha".to_string());
+            map.insert("mem://beta-note".to_string(), "beta".to_string());
+        }
         let hub = ListChangedHub::new(UpstreamSlot::new(), owners.clone(), None);
 
         hub.notify("alpha", ListKind::Resources);
+        settle().await;
+
+        let map = owners.read().unwrap();
         assert!(
-            owners.read().unwrap().is_empty(),
-            "карта владельцев обязана сброситься"
+            !map.contains_key("mem://alpha-note"),
+            "записи сообщившего сервера обязаны уйти: {map:?}"
+        );
+        assert_eq!(
+            map.get("mem://beta-note").map(String::as_str),
+            Some("beta"),
+            "чужие записи трогать нельзя: {map:?}"
         );
     }
 
     #[tokio::test]
     async fn tool_list_changed_leaves_the_resource_cache_alone() {
-        // Смена списка ИНСТРУМЕНТОВ маршрутизацию ресурсов не затрагивает:
-        // сбрасывать карту здесь значило бы дарить downstream'у способ
-        // заставлять гейтвей веерно перелистывать всех.
-        let owners = owners_with("mem://note", "alpha");
+        // Смена списка ИНСТРУМЕНТОВ маршрутизацию ресурсов не затрагивает.
+        let owners = Arc::new(RwLock::new(HashMap::new()));
+        owners
+            .write()
+            .unwrap()
+            .insert("mem://note".to_string(), "alpha".to_string());
         let hub = ListChangedHub::new(UpstreamSlot::new(), owners.clone(), None);
 
         hub.notify("alpha", ListKind::Tools);
+        settle().await;
         assert_eq!(owners.read().unwrap().len(), 1);
     }
 
     #[tokio::test]
-    async fn a_burst_from_many_servers_is_coalesced_into_one_send() {
-        // Пять downstream'ов, разом сообщивших об изменении, — это один факт
-        // «список больше не тот», а не пять. Наружу должно уйти одно
-        // уведомление на категорию.
+    async fn a_flood_cannot_wipe_the_journal() {
+        // P1 ревью M2-full: запись в журнал стояла ДО схлопывания, и каждое
+        // уведомление порождало запись. Недоверенный сервер за минуту вымывал
+        // ротацией всю историю, включая записи о заблокированных вызовах, —
+        // то есть бесплатно отключал главный товар продукта.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("calls.jsonl");
+        let log = crate::logger::start(path.clone(), crate::logger::DEFAULT_MAX_LOG_BYTES);
+
+        // Улика: настоящая запись о заблокированном вызове.
+        log.write(CallRecord {
+            ts: now_rfc3339(),
+            id: "ev-evidence".into(),
+            server: "github".into(),
+            tool: "create_issue".into(),
+            decision: "deny".into(),
+            enforced: true,
+            ..Default::default()
+        });
+
         let hub = ListChangedHub::new(
             UpstreamSlot::new(),
             Arc::new(RwLock::new(HashMap::new())),
-            None,
+            Some(log),
         );
-        for server in ["a", "b", "c", "d", "e"] {
-            hub.notify(server, ListKind::Tools);
+        for _ in 0..5_000 {
+            hub.notify("evil", ListKind::Tools);
         }
-        let scheduled = hub
-            .inner
-            .state
-            .lock()
-            .unwrap()
-            .get(&ListKind::Tools)
-            .map(|s| s.scheduled)
-            .unwrap_or(false);
-        assert!(scheduled, "отправка запланирована");
-        // Ровно одна запись на категорию — значит запланирована одна отправка,
-        // а не пять.
-        assert_eq!(hub.inner.state.lock().unwrap().len(), 1);
+        settle().await;
+
+        let records = crate::logger::read_records(&path).unwrap_or_default();
+        let list_records = records.iter().filter(|r| r.tool == "list_changed").count();
+        assert!(
+            list_records <= 2,
+            "5000 уведомлений обязаны схлопнуться в сводку, а не в {list_records} записей"
+        );
+        assert!(
+            records.iter().any(|r| r.id == "ev-evidence"),
+            "улика обязана уцелеть: {} записей",
+            records.len()
+        );
     }
 
     #[tokio::test]
-    async fn every_incoming_notification_is_audited_with_its_source() {
-        // Наружу уходит одно уведомление, но расследование не должно терять,
-        // КТО именно менялся.
+    async fn the_summary_names_every_source() {
+        // Наружу уходит одно уведомление и одна запись, но расследование не
+        // должно терять, КТО именно менялся и сколько раз.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("calls.jsonl");
         let log = crate::logger::start(path.clone(), crate::logger::DEFAULT_MAX_LOG_BYTES);
@@ -536,26 +632,18 @@ mod tests {
 
         hub.notify("alpha", ListKind::Tools);
         hub.notify("beta", ListKind::Tools);
+        hub.notify("beta", ListKind::Tools);
+        settle().await;
 
-        let mut records = Vec::new();
-        for _ in 0..100 {
-            records = crate::logger::read_records(&path).unwrap_or_default();
-            if records.len() >= 2 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        let sources: Vec<String> = records
+        let records = crate::logger::read_records(&path).unwrap_or_default();
+        let summary = records
             .iter()
-            .filter(|r| r.tool == "list_changed")
-            .filter_map(|r| r.matched_rule.clone())
-            .collect();
-        assert_eq!(sources.len(), 2, "обе записи на месте: {sources:?}");
-        assert!(
-            sources.iter().any(|s| s.starts_with("alpha")),
-            "{sources:?}"
-        );
-        assert!(sources.iter().any(|s| s.starts_with("beta")), "{sources:?}");
+            .find(|r| r.tool == "list_changed")
+            .and_then(|r| r.matched_rule.clone())
+            .expect("сводка обязана быть");
+        assert!(summary.contains("alpha×1"), "{summary}");
+        assert!(summary.contains("beta×2"), "{summary}");
+        assert!(summary.contains("tools"), "{summary}");
     }
 
     #[tokio::test]

@@ -301,7 +301,18 @@ pub async fn run_echo_fixture_stdio() -> Result<(), Box<dyn std::error::Error + 
 /// клиент ждёт свой. Без перевода прогресс либо теряется, либо адресуется в
 /// пустоту.
 #[derive(Clone)]
-pub struct ProgressFixture;
+pub struct ProgressFixture {
+    /// Имя, которым фикстура подписывает свои уведомления: без него нельзя
+    /// проверить, не уехал ли прогресс одного сервера в вызов к другому.
+    name: String,
+}
+
+impl ProgressFixture {
+    /// Фикстура, подписывающая прогресс своим именем.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self { name: name.into() }
+    }
+}
 
 impl rmcp::ServerHandler for ProgressFixture {
     fn get_info(&self) -> rmcp::model::ServerInfo {
@@ -333,7 +344,7 @@ impl rmcp::ServerHandler for ProgressFixture {
             for step in 1..=3u32 {
                 let param = rmcp::model::ProgressNotificationParam::new(token.clone(), step as f64)
                     .with_total(3.0)
-                    .with_message(format!("step {step}"));
+                    .with_message(format!("{}#{step}", self.name));
                 let _ = context.peer.notify_progress(param).await;
             }
         }

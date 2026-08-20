@@ -976,7 +976,7 @@ async fn progress_from_downstream_reaches_the_client_with_its_own_token() {
     // Фикстура и гейтвей обязаны делить ОДИН мост, иначе переводить нечем.
     let (fixture_io, server_io) = tokio::io::duplex(64 * 1024);
     tokio::spawn(async move {
-        if let Ok(running) = ProgressFixture.serve(server_io).await {
+        if let Ok(running) = ProgressFixture::new("prog").serve(server_io).await {
             let _ = running.waiting().await;
         }
     });
@@ -1088,5 +1088,124 @@ sig = "prog__work"
             token, &expected_token,
             "уведомление о шаге {step} пришло с ЧУЖИМ токеном: клиент не свяжет              его со своим вызовом (downstream-токен вместо клиентского)"
         );
+    }
+}
+
+#[tokio::test]
+async fn progress_of_one_server_never_lands_in_a_call_to_another() {
+    // P1 ревью M2-full. Счётчик progress-токенов у rmcp свой на каждого пира и
+    // начинается с нуля, поэтому n-й запрос к серверу A и n-й запрос к серверу
+    // B получают ОДИН И ТОТ ЖЕ токен. Пока мост был ключом только по токену:
+    // регистрации затирали друг друга, прогресс уезжал в чужой вызов, часть
+    // уведомлений пропадала совсем — а враждебный сервер мог веером вписывать
+    // СВОЙ текст в ход чужой операции (клиент показывает `message` человеку).
+    let bridge = zastava_proxy::downstream::ProgressBridge::new();
+
+    let mut downstreams = HashMap::new();
+    for name in ["a", "b"] {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let fixture = ProgressFixture::new(name);
+        tokio::spawn(async move {
+            if let Ok(running) = fixture.serve(server_io).await {
+                let _ = running.waiting().await;
+            }
+        });
+        let ds = DownstreamHandler::with_progress(name, UpstreamSlot::new(), bridge.clone())
+            .serve(client_io)
+            .await
+            .expect("downstream client");
+        downstreams.insert(name.to_string(), ds);
+    }
+
+    let policy_toml = r#"
+[servers.a]
+command = "unused-in-tests"
+[servers.b]
+command = "unused-in-tests"
+"#;
+    let config = Config::from_toml_str(policy_toml).unwrap();
+    let gateway = Gateway::with_options(
+        downstreams,
+        Arc::new(RwLock::new(PolicyEngine::from_config(&config.policy))),
+        None,
+        Duration::from_millis(5_000),
+        Duration::from_millis(2_000),
+        GatewayOptions {
+            progress: bridge,
+            ..GatewayOptions::default()
+        },
+    );
+    let (client_io, gw_io) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        if let Ok(running) = gateway.serve(gw_io).await {
+            let _ = running.waiting().await;
+        }
+    });
+
+    let recorder = RecordingMessages::default();
+    let seen = recorder.seen.clone();
+    let client = recorder.serve(client_io).await.expect("recording client");
+
+    // Два вызова, по одному к каждому серверу. Их downstream-токены совпадут.
+    let mut tokens = HashMap::new();
+    let mut handles = Vec::new();
+    for name in ["a", "b"] {
+        let handle = client
+            .send_cancellable_request(
+                rmcp::model::ClientRequest::CallToolRequest(rmcp::model::CallToolRequest::new(
+                    call(&format!("{name}__work"), serde_json::json!({})),
+                )),
+                rmcp::service::PeerRequestOptions::no_options(),
+            )
+            .await
+            .expect("запрос уходит");
+        tokens.insert(name, handle.progress_token.clone());
+        handles.push(handle);
+    }
+    for handle in handles {
+        let _ = handle.await_response().await;
+    }
+
+    // Ждём, пока уведомления дойдут.
+    let mut got = Vec::new();
+    for _ in 0..100 {
+        got = seen.lock().expect("seen").clone();
+        if got.len() >= 6 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    assert_eq!(
+        got.len(),
+        6,
+        "оба вызова должны отчитаться по три раза: {got:?}"
+    );
+    for (token, message) in &got {
+        let owner = if message.starts_with("a#") { "a" } else { "b" };
+        assert_eq!(
+            token,
+            tokens.get(owner).expect("токен вызова"),
+            "уведомление «{message}» уехало в вызов к ДРУГОМУ серверу"
+        );
+    }
+}
+
+/// Клиент, запоминающий токен и текст каждого уведомления.
+#[derive(Clone, Default)]
+struct RecordingMessages {
+    seen: std::sync::Arc<std::sync::Mutex<Vec<(rmcp::model::ProgressToken, String)>>>,
+}
+
+impl rmcp::handler::client::ClientHandler for RecordingMessages {
+    async fn on_progress(
+        &self,
+        params: rmcp::model::ProgressNotificationParam,
+        _context: rmcp::service::NotificationContext<rmcp::service::RoleClient>,
+    ) {
+        self.seen
+            .lock()
+            .expect("seen")
+            .push((params.progress_token, params.message.unwrap_or_default()));
     }
 }
