@@ -313,7 +313,11 @@ mod tests {
     #[test]
     fn unix_absolute_paths_keep_their_root() {
         let rules = CanonRules::default();
-        let subset = rules.subset("fs", "read_file", &args(&[("path", "/home/alice/proj/a/b")]));
+        let subset = rules.subset(
+            "fs",
+            "read_file",
+            &args(&[("path", "/home/alice/proj/a/b")]),
+        );
         assert_eq!(subset["path"], "/home/alice/proj/…");
     }
 
@@ -336,7 +340,7 @@ mod tests {
         let subset = rules.subset(
             "fs",
             "read_file",
-            &args(&[("path", r"C:\path\to\zastava\README.md")]),
+            &args(&[("path", r"C:\Users\alice\Desktop\zastava\README.md")]),
         );
         assert_eq!(subset["path"], "C:/Users/alice/Desktop/…");
     }

@@ -322,7 +322,7 @@ mod tests {
 
     #[test]
     fn truncation_keeps_the_root() {
-        let (short, cut) = resolve(r"C:\path\to\zastava\README.md")
+        let (short, cut) = resolve(r"C:\Users\alice\Desktop\zastava\README.md")
             .unwrap()
             .truncated(3);
         assert!(cut);
