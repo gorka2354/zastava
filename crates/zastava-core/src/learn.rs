@@ -146,23 +146,30 @@ pub fn suggest(records: &[CallRecord], config: &Config) -> LearnOutput {
     // Сниппеты собираются СЕРИАЛИЗАТОРАМИ, а не склейкой строк: даже после
     // whitelist-фильтра выше генерация текста из недоверенных имён обязана
     // идти через экранирование (тот же принцип, что в `import`).
-    let toml_snippet = if proposals.is_empty() {
-        String::new()
-    } else {
-        let doc = AllowDoc {
-            policy: PolicyDoc {
-                allow: proposals
-                    .iter()
-                    .map(|p| RuleConfig {
+    // Каждое правило сериализуется ОТДЕЛЬНЫМ документом и уже потом
+    // склеивается. Иначе toml выносит все под-таблицы `args` в конец, и
+    // матчер оказывается визуально оторван от своего правила — а инструкция
+    // пользователю звучит «вычеркни лишнее»: удалив блок выше, он молча
+    // переприкрепил бы сужение к чужому правилу.
+    let toml_snippet = proposals
+        .iter()
+        .map(|p| {
+            let doc = AllowDoc {
+                policy: PolicyDoc {
+                    allow: vec![RuleConfig {
                         sig: p.sig.clone(),
                         args: p.args.clone(),
                         deny_extra_args: false,
-                    })
-                    .collect(),
-            },
-        };
-        toml::to_string_pretty(&doc).unwrap_or_default()
-    };
+                    }],
+                },
+            };
+            toml::to_string_pretty(&doc).unwrap_or_default()
+        })
+        .collect::<Vec<_>>()
+        .join(
+            "
+",
+        );
 
     let client_allow_snippet = if proposals.is_empty() {
         String::new()

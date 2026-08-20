@@ -98,14 +98,24 @@ pub async fn run(config: Config, options: RunOptions) -> Result<(), ProxyError> 
             detail,
         ));
     }
+    let canon = Arc::new(RwLock::new(zastava_core::CanonRules::from_config(
+        &config.canon,
+    )));
     let _watch_guard = options
         .config_path
         .filter(|_| !options.passthrough)
-        .and_then(|path| match reload::watch(path, policy.clone()) {
-            Ok(guard) => Some(guard),
-            Err(e) => {
-                tracing::warn!(error = %e, "config watch unavailable; live reload disabled");
-                None
+        .and_then(|path| {
+            let targets = reload::ReloadTargets {
+                policy: policy.clone(),
+                canon: canon.clone(),
+                log: log.clone(),
+            };
+            match reload::watch(path, targets) {
+                Ok(guard) => Some(guard),
+                Err(e) => {
+                    tracing::warn!(error = %e, "config watch unavailable; live reload disabled");
+                    None
+                }
             }
         });
 
@@ -118,7 +128,7 @@ pub async fn run(config: Config, options: RunOptions) -> Result<(), ProxyError> 
         gateway::GatewayOptions {
             passthrough: options.passthrough,
             log_args: config.log.log_args,
-            canon: zastava_core::CanonRules::from_config(&config.canon),
+            canon,
         },
     );
     let service = gateway

@@ -135,7 +135,7 @@ pub struct GatewayOptions {
     /// Писать в журнал полные аргументы вызовов (опт-ин, см. `log.log_args`).
     pub log_args: bool,
     /// Правила канонизации аргументов.
-    pub canon: CanonRules,
+    pub canon: Arc<RwLock<CanonRules>>,
 }
 
 /// Гейтвей: реализация ServerHandler поверх множества downstream'ов.
@@ -147,9 +147,10 @@ pub struct Gateway {
     list_timeout: Duration,
     passthrough: bool,
     log_args: bool,
-    /// Правила канонизации аргументов для журнала. Читаются на каждом вызове
-    /// вместе с политикой; живут в Arc, потому что reload может их заменить.
-    canon: CanonRules,
+    /// Правила канонизации аргументов для журнала. За RwLock по той же
+    /// причине, что и политика: `zastava.toml` может измениться на ходу, и
+    /// журнал обязан писаться по действующим правилам, а не по стартовым.
+    canon: Arc<RwLock<CanonRules>>,
     /// Возможности, вычисленные из реальных downstream'ов: объявлять
     /// resources/prompts, которых ни у кого нет, — врать клиенту.
     capabilities: ServerCapabilities,
@@ -316,7 +317,11 @@ impl Gateway {
         log.write(CallRecord {
             ts: now_rfc3339(),
             id: next_event_id(),
-            canonical_subset: self.canon.subset(&server, &tool, args),
+            canonical_subset: {
+                // Гуард живёт ровно на время вычисления и НЕ переживает await.
+                let canon = self.canon.read().expect("canon lock poisoned");
+                canon.subset(&server, &tool, args)
+            },
             server,
             tool,
             name_sanitized: server_dirty || tool_dirty,

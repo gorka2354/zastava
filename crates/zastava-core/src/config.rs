@@ -186,7 +186,7 @@ pub struct RuleConfig {
     /// свободны — этого хватает, когда ресурс определяет один ключ (`repo`).
     /// Там, где на ресурс может указывать несколько разных ключей
     /// (`path` и `paths`), опция закрывает обход через непокрытый ключ.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub deny_extra_args: bool,
 }
 

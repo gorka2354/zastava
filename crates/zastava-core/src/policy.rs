@@ -122,6 +122,16 @@ impl PolicyEngine {
         self.mode
     }
 
+    /// Действие для непокрытых вызовов.
+    pub fn default_action(&self) -> DefaultAction {
+        self.default
+    }
+
+    /// Сколько правил скомпилировано.
+    pub fn rule_count(&self) -> usize {
+        self.rules.len()
+    }
+
     /// Есть ли правило, покрывающее пару (server, tool) на tool-уровне —
     /// БЕЗ учёта аргументных матчеров. Нужно `learn`: правило с матчером
     /// аргументов означает осознанное сужение, и предлагать поверх него

@@ -153,13 +153,33 @@ fn check(path: &Path) -> anyhow::Result<()> {
     );
     for rule in &config.policy.allow {
         match &rule.args {
-            Some(args) => println!(
-                "    allow {}  args{{{}}}",
-                rule.sig,
-                args.keys().cloned().collect::<Vec<_>>().join(", ")
-            ),
+            Some(args) => {
+                let narrowing = args
+                    .iter()
+                    .map(|(key, matcher)| format!("{key} {}", describe_matcher(matcher)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let strict = if rule.deny_extra_args {
+                    ", без прочих аргументов"
+                } else {
+                    ""
+                };
+                println!("    allow {}  ({narrowing}{strict})", rule.sig);
+            }
             None => println!("    allow {}  (tool-level)", rule.sig),
         }
+    }
+    // Что именно уедет в журнал открыто — вопрос приватности, и ответ на него
+    // должен быть виден до первого вызова, а не после разбора инцидента.
+    if !config.canon.extra_keys.is_empty() || !config.canon.deny_keys.is_empty() {
+        println!(
+            "  canon:   +[{}] -[{}] поверх дефолтного whitelist",
+            config.canon.extra_keys.join(", "),
+            config.canon.deny_keys.join(", ")
+        );
+    }
+    for rule in &config.canon.rules {
+        println!("    canon {} → [{}]", rule.sig, rule.keys.join(", "));
     }
     println!("  log:     {}", resolve_log_path(&config).display());
     if config.log.log_args {
@@ -230,6 +250,15 @@ fn stats(path: &Path) -> anyhow::Result<()> {
             summary.abandoned
         );
     }
+    if summary.annotations > 0 {
+        println!("  заметок annotate:    {}", summary.annotations);
+    }
+    if summary.weakenings > 0 {
+        println!(
+            "  ОСЛАБЛЕНИЙ политики: {} (см. маркеры policy_weakened в журнале)",
+            summary.weakenings
+        );
+    }
     if summary.markers > 0 {
         println!("  событий гейтвея:     {}", summary.markers);
     }
@@ -280,16 +309,16 @@ fn allow(path: &Path, sig: &str) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Простое дописывание блока в конец: комментарии и форматирование юзера
-    // не трогаем (toml_edit-полировка — M3). Работающий гейтвей подхватит
-    // файл через watcher без рестарта сессии.
+    // Дописывание блока в конец, а не round-trip через сериализатор:
+    // комментарии и форматирование пользователя остаются байт в байт.
+    // Работающий гейтвей подхватит файл через watcher без рестарта сессии.
     let mut raw = std::fs::read_to_string(path)?;
     if !raw.ends_with('\n') {
         raw.push('\n');
     }
     raw.push_str(&format!("\n[[policy.allow]]\nsig = \"{sig}\"\n"));
     Config::from_toml_str(&raw).context("internal: appended config became invalid")?;
-    std::fs::write(path, raw)?;
+    write_atomic(path, &raw)?;
     println!("Добавлено allow-правило: {sig}");
     Ok(())
 }
@@ -555,6 +584,35 @@ fn import(config_path: &Path, from: Option<&Path>, force: bool) -> anyhow::Resul
     }
     println!("Дальше: `zastava check`, затем подключи заставу в клиенте.");
     Ok(())
+}
+
+/// Записывает файл целиком или не записывает вовсе: сначала во временный
+/// файл рядом, затем rename поверх.
+///
+/// Обычная запись усекает файл и наполняет его заново. Гейтвей в это время
+/// следит за конфигом — и обрезанный на середине TOML часто остаётся ВАЛИДНЫМ
+/// (если обрыв пришёлся до секции `[policy]`), так что watcher принял бы
+/// конфиг без единого правила. Для инструмента, чья работа — применять
+/// политику, это худший вид отказа: тихое ослабление.
+fn write_atomic(path: &Path, content: &str) -> anyhow::Result<()> {
+    let dir = path.parent().unwrap_or(Path::new("."));
+    // Временный файл обязан лежать в той же директории: rename атомарен
+    // только внутри одной файловой системы.
+    let tmp = dir.join(format!(
+        ".{}.tmp",
+        path.file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "zastava".to_string())
+    ));
+    std::fs::write(&tmp, content)
+        .with_context(|| format!("cannot write temp file {}", tmp.display()))?;
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e).with_context(|| format!("cannot replace {}", path.display()))
+        }
+    }
 }
 
 /// Пишет файл с правами только для владельца там, где ОС это умеет.

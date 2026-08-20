@@ -26,10 +26,17 @@ pub struct StatsSummary {
     pub abandoned: u64,
     /// Маркеров-событий гейтвея (старт, отключение аудита, ротация).
     pub markers: u64,
-    /// Уникальных сигнатур С УЧЁТОМ хэша аргументов. canonical_subset в v0
-    /// всегда пуст, поэтому tool-level счёт схлопывает вызовы с разными
-    /// аргументами и завышает выгоду policy-once — честный M/N лежит в
-    /// диапазоне между двумя цифрами (находка верификации M1).
+    /// Заметок `zastava annotate`: сколько раз человек оценил срабатывание.
+    /// Единственная цифра здесь, которая приходит не от машины, — и потому
+    /// единственная, по которой видно, приносит ли гейт пользу.
+    pub annotations: u64,
+    /// Ослаблений политики на живом reload (enforce -> warn, снятие правил).
+    pub weakenings: u64,
+    /// Уникальных сигнатур С УЧЁТОМ хэша аргументов. `canonical_subset`
+    /// покрывает только ключи-идентификаторы, поэтому счёт по нему схлопывает
+    /// вызовы, различающиеся остальными аргументами, и завышает выгоду
+    /// policy-once — честный M/N лежит в диапазоне между двумя цифрами
+    /// (находка верификации M1).
     pub unique_sigs_with_args: u64,
 }
 
@@ -49,6 +56,11 @@ pub fn summarize(records: &[CallRecord]) -> StatsSummary {
     for record in records {
         if !record.is_call() {
             summary.markers += 1;
+            match record.tool.as_str() {
+                "annotation" => summary.annotations += 1,
+                "policy_weakened" => summary.weakenings += 1,
+                _ => {}
+            }
             continue;
         }
         summary.total += 1;
@@ -123,6 +135,21 @@ mod tests {
         assert_eq!(s.unique_sigs, 1);
         assert_eq!(s.unique_sigs_with_args, 2);
         assert_eq!(s.repeats, 1, "tool-level повтор остаётся повтором");
+    }
+
+    #[test]
+    fn annotations_and_weakenings_are_counted_separately() {
+        let records = vec![
+            CallRecord::marker("t".into(), "1".into(), "annotation", Some("помогло".into())),
+            CallRecord::marker("t".into(), "2".into(), "policy_weakened", None),
+            CallRecord::marker("t".into(), "3".into(), "gateway_started", None),
+            record("a", "ping", "allow", false),
+        ];
+        let s = summarize(&records);
+        assert_eq!(s.annotations, 1);
+        assert_eq!(s.weakenings, 1);
+        assert_eq!(s.markers, 3);
+        assert_eq!(s.total, 1);
     }
 
     #[test]

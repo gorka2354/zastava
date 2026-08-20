@@ -81,7 +81,9 @@ async fn gateway_with_canon(config_toml: &str) -> TestGateway {
         Duration::from_millis(5_000),
         Duration::from_millis(2_000),
         GatewayOptions {
-            canon: zastava_core::CanonRules::from_config(&config.canon),
+            canon: Arc::new(RwLock::new(zastava_core::CanonRules::from_config(
+                &config.canon,
+            ))),
             ..GatewayOptions::default()
         },
     );
@@ -576,7 +578,15 @@ async fn policy_reload_picks_up_new_rules_without_restart() {
     let config = Config::from_toml_str(ENFORCE_NO_RULES).unwrap();
 
     let policy = Arc::new(RwLock::new(PolicyEngine::from_config(&config.policy)));
-    let _watch = zastava_proxy::reload::watch(config_path.clone(), policy.clone()).unwrap();
+    let _watch = zastava_proxy::reload::watch(
+        config_path.clone(),
+        zastava_proxy::reload::ReloadTargets {
+            policy: policy.clone(),
+            canon: Arc::new(RwLock::new(zastava_core::CanonRules::default())),
+            log: None,
+        },
+    )
+    .unwrap();
 
     let mut downstreams = HashMap::new();
     downstreams.insert("alpha".to_string(), fixture_downstream("alpha").await);
@@ -752,4 +762,59 @@ mode = \"enforce\"
     assert!(engine
         .decide("alpha", "write_file", outside.as_object().unwrap())
         .blocks());
+}
+
+#[tokio::test]
+async fn weakening_the_policy_on_reload_leaves_an_audit_trail() {
+    // Тихо отредактировать конфиг и снять контроль — самый дешёвый способ
+    // обойти заставу. Он остаётся возможным (это файл пользователя), но
+    // обязан быть ЗАМЕТНЫМ при чтении журнала.
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("zastava.toml");
+    std::fs::write(&config_path, ENFORCE_ALLOW_ALL).unwrap();
+    let config = Config::from_toml_str(ENFORCE_ALLOW_ALL).unwrap();
+
+    let log_dir = tempfile::tempdir().unwrap();
+    let log_path = log_dir.path().join("calls.jsonl");
+    let log = logger::start(log_path.clone(), logger::DEFAULT_MAX_LOG_BYTES);
+
+    let policy = Arc::new(RwLock::new(PolicyEngine::from_config(&config.policy)));
+    let _watch = zastava_proxy::reload::watch(
+        config_path.clone(),
+        zastava_proxy::reload::ReloadTargets {
+            policy: policy.clone(),
+            canon: Arc::new(RwLock::new(zastava_core::CanonRules::default())),
+            log: Some(log),
+        },
+    )
+    .unwrap();
+
+    // enforce + правило → warn без правил: ослабление по обоим признакам.
+    std::fs::write(
+        &config_path,
+        "[servers.alpha]
+command = \"unused-in-tests\"
+[policy]
+mode = \"warn\"
+",
+    )
+    .unwrap();
+
+    let mut marker = None;
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let records = logger::read_records(&log_path).unwrap_or_default();
+        if let Some(found) = records.iter().find(|r| r.tool == "policy_weakened") {
+            marker = Some(found.clone());
+            break;
+        }
+    }
+    let marker = marker.expect("ослабление политики обязано попасть в журнал");
+    assert!(!marker.is_call(), "это маркер события, а не вызов");
+    let detail = marker.matched_rule.clone().unwrap_or_default();
+    assert!(
+        detail.contains("enforce -> warn"),
+        "маркер обязан называть причину: {detail}"
+    );
+    assert!(detail.contains("rules 1 -> 0"), "{detail}");
 }
