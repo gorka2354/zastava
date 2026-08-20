@@ -10,7 +10,9 @@ use rmcp::model::{CallToolRequestParams, CallToolResult, ContentBlock};
 use rmcp::ServiceExt;
 use zastava_core::{Config, PolicyEngine};
 use zastava_proxy::downstream::{DownstreamHandler, UpstreamSlot};
-use zastava_proxy::fixture::{EchoFixture, EndlessPagingFixture, HangingFixture, RichFixture};
+use zastava_proxy::fixture::{
+    EchoFixture, EndlessPagingFixture, HangingFixture, ProgressFixture, RichFixture,
+};
 use zastava_proxy::gateway::{DownstreamService, Gateway, GatewayOptions};
 use zastava_proxy::logger;
 
@@ -939,4 +941,152 @@ async fn zastava_refuses_reverse_requests_instead_of_answering_for_the_user() {
         text.contains("does not forward") || text.contains("roots/list"),
         "отказ должен объяснять причину: {text}"
     );
+}
+
+/// Клиент, запоминающий пришедшие progress-уведомления.
+///
+/// Дефолтный `()` их молча выбрасывает, поэтому проверить перевод токенов им
+/// нельзя.
+#[derive(Clone, Default)]
+struct RecordingClient {
+    seen: std::sync::Arc<std::sync::Mutex<Vec<(rmcp::model::ProgressToken, f64)>>>,
+}
+
+impl rmcp::handler::client::ClientHandler for RecordingClient {
+    async fn on_progress(
+        &self,
+        params: rmcp::model::ProgressNotificationParam,
+        _context: rmcp::service::NotificationContext<rmcp::service::RoleClient>,
+    ) {
+        self.seen
+            .lock()
+            .expect("seen lock")
+            .push((params.progress_token, params.progress));
+    }
+}
+
+#[tokio::test]
+async fn progress_from_downstream_reaches_the_client_with_its_own_token() {
+    // rmcp, отправляя запрос вниз, БЕЗУСЛОВНО подставляет собственный
+    // progress-токен: прокинуть клиентский невозможно. Значит downstream шлёт
+    // уведомления на свой токен, а клиент ждёт свой — без перевода прогресс
+    // либо теряется, либо адресуется в пустоту.
+    let bridge = zastava_proxy::downstream::ProgressBridge::new();
+
+    // Фикстура и гейтвей обязаны делить ОДИН мост, иначе переводить нечем.
+    let (fixture_io, server_io) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        if let Ok(running) = ProgressFixture.serve(server_io).await {
+            let _ = running.waiting().await;
+        }
+    });
+    let ds = DownstreamHandler::with_progress("prog", UpstreamSlot::new(), bridge.clone())
+        .serve(fixture_io)
+        .await
+        .expect("downstream client");
+
+    let mut downstreams = HashMap::new();
+    downstreams.insert("prog".to_string(), ds);
+
+    // Политика разрешает только `work`. Отклонённый вызов НЕ уходит вниз —
+    // это и разводит счётчики токенов у клиента и у downstream'а, иначе они
+    // идут в ногу от нуля и совпадают случайно (тест бы вырождался).
+    let policy_toml = r#"
+[servers.prog]
+command = "unused-in-tests"
+[policy]
+mode = "enforce"
+default = "deny"
+[[policy.allow]]
+sig = "prog__work"
+"#;
+    let config = Config::from_toml_str(policy_toml).unwrap();
+    let gateway = Gateway::with_options(
+        downstreams,
+        Arc::new(RwLock::new(PolicyEngine::from_config(&config.policy))),
+        None,
+        Duration::from_millis(5_000),
+        Duration::from_millis(2_000),
+        GatewayOptions {
+            progress: bridge,
+            ..GatewayOptions::default()
+        },
+    );
+    let (client_io, gw_io) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        if let Ok(running) = gateway.serve(gw_io).await {
+            let _ = running.waiting().await;
+        }
+    });
+
+    let recorder = RecordingClient::default();
+    let seen = recorder.seen.clone();
+    let client = recorder.serve(client_io).await.expect("recording client");
+
+    // Отклоняемый вызов: клиентский счётчик токенов сдвигается, downstream
+    // о нём вообще не узнаёт.
+    let _ = client
+        .call_tool(call("prog__forbidden", serde_json::json!({})))
+        .await;
+
+    // Шлём запрос НИЗКОУРОВНЕВО, чтобы узнать токен, который rmcp назначил
+    // клиенту: именно с ним и надо сравнивать пришедшие уведомления. Через
+    // `call_tool` токен остался бы невидимым, и тест доказывал бы только факт
+    // доставки, а не перевод.
+    let handle = client
+        .send_cancellable_request(
+            rmcp::model::ClientRequest::CallToolRequest(rmcp::model::CallToolRequest::new(call(
+                "prog__work",
+                serde_json::json!({}),
+            ))),
+            rmcp::service::PeerRequestOptions::no_options(),
+        )
+        .await
+        .expect("запрос уходит");
+    let expected_token = handle.progress_token.clone();
+    let response = handle.await_response().await.expect("ответ приходит");
+    let rmcp::model::ServerResult::CallToolResult(result) = response else {
+        panic!("ожидали результат вызова инструмента: {response:?}");
+    };
+    let answer = text_of(&result);
+    assert!(answer.starts_with("done"), "{answer}");
+    // Фикстура назвала СВОЙ токен. Если он совпал с клиентским, проверка
+    // перевода ничего не значит — тогда тест обязан упасть, а не молча пройти.
+    let downstream_token = answer
+        .split("token=")
+        .nth(1)
+        .expect("фикстура называет свой токен")
+        .to_string();
+    let client_token = format!("{expected_token:?}");
+    assert_ne!(
+        downstream_token, client_token,
+        "токены совпали — проверка перевода вырождается в тавтологию"
+    );
+
+    // Уведомления идут отдельным потоком от ответа — даём им дойти.
+    let mut got = Vec::new();
+    for _ in 0..100 {
+        got = seen.lock().expect("seen lock").clone();
+        if got.len() >= 3 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    assert_eq!(
+        got.len(),
+        3,
+        "клиент должен увидеть все три уведомления: {got:?}"
+    );
+    let steps: Vec<f64> = got.iter().map(|(_, p)| *p).collect();
+    assert_eq!(steps, vec![1.0, 2.0, 3.0], "порядок и значения сохраняются");
+
+    // Токен обязан быть ТОТ, который клиент ждёт, — иначе он не свяжет
+    // уведомление со своим вызовом.
+    for (token, step) in &got {
+        assert_eq!(
+            token, &expected_token,
+            "уведомление о шаге {step} пришло с ЧУЖИМ токеном: клиент не свяжет              его со своим вызовом (downstream-токен вместо клиентского)"
+        );
+    }
 }

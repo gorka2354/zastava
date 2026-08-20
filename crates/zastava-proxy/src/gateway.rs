@@ -136,6 +136,8 @@ pub struct GatewayOptions {
     pub log_args: bool,
     /// Правила канонизации аргументов.
     pub canon: Arc<RwLock<CanonRules>>,
+    /// Общий с downstream-обработчиками мост progress-токенов.
+    pub progress: crate::downstream::ProgressBridge,
 }
 
 /// Гейтвей: реализация ServerHandler поверх множества downstream'ов.
@@ -158,6 +160,8 @@ pub struct Gateway {
     /// именем, поэтому префиксовать их нельзя (сломается адресация) —
     /// маршрутизируем по карте владения, которую обновляем на листинге.
     resource_owners: Arc<RwLock<HashMap<String, String>>>,
+    /// Перевод progress-токенов: downstream шлёт свой, клиент ждёт свой.
+    progress: crate::downstream::ProgressBridge,
 }
 
 /// Потолки обхода пагинации downstream'а. Без них downstream, повторяющий
@@ -217,6 +221,7 @@ impl Gateway {
             passthrough: options.passthrough,
             log_args: options.log_args,
             canon: options.canon,
+            progress: options.progress,
             capabilities,
             resource_owners: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -536,10 +541,13 @@ impl ServerHandler for Gateway {
         let mut downstream_req = request;
         downstream_req.name = tool.to_string().into();
         let started = Instant::now();
+        // Таймаут отдаём rmcp и просим продлевать его, пока downstream шлёт
+        // прогресс: долгая, но живая операция не должна обрываться по общему
+        // бюджету. Свой `select!` ниже остаётся — он ловит отмену клиентом.
         let sent = ds
             .send_cancellable_request(
                 ClientRequest::CallToolRequest(CallToolRequest::new(downstream_req)),
-                PeerRequestOptions::no_options(),
+                PeerRequestOptions::with_timeout(self.call_timeout).reset_timeout_on_progress(),
             )
             .await;
 
@@ -564,6 +572,17 @@ impl ServerHandler for Gateway {
         let forwarded = match sent {
             Err(e) => Forwarded::NotSent(e),
             Ok(mut handle) => {
+                // Клиент прислал свой progress-токен только если сам просил
+                // прогресса. rmcp подставил вниз СВОЙ токен — связываем их на
+                // время вызова; страж снимет связь на любом выходе.
+                let _progress = context.meta.get_progress_token().map(|client_token| {
+                    self.progress.register(
+                        handle.progress_token.clone(),
+                        client_token,
+                        context.peer.clone(),
+                    )
+                });
+
                 enum Stop {
                     Answered(Box<Result<ServerResult, ServiceError>>),
                     Timeout,

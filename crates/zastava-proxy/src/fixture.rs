@@ -293,3 +293,61 @@ pub async fn run_echo_fixture_stdio() -> Result<(), Box<dyn std::error::Error + 
     service.waiting().await?;
     Ok(())
 }
+
+/// Фикстура, репортящая ход длинной операции.
+///
+/// Нужна для проверки перевода progress-токенов: downstream шлёт уведомления
+/// на СВОЙ токен (его назначил rmcp, когда застава отправляла запрос вниз), а
+/// клиент ждёт свой. Без перевода прогресс либо теряется, либо адресуется в
+/// пустоту.
+#[derive(Clone)]
+pub struct ProgressFixture;
+
+impl rmcp::ServerHandler for ProgressFixture {
+    fn get_info(&self) -> rmcp::model::ServerInfo {
+        let mut info = rmcp::model::ServerInfo::default();
+        info.capabilities = rmcp::model::ServerCapabilities::builder()
+            .enable_tools()
+            .build();
+        info
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> Result<rmcp::model::ListToolsResult, rmcp::model::ErrorData> {
+        Ok(
+            rmcp::model::ListToolsResult::with_all_items(vec![stub_tool("work")])
+                .with_ttl_ms(0)
+                .with_cache_scope(rmcp::model::CacheScope::Private),
+        )
+    }
+
+    async fn call_tool(
+        &self,
+        _request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> Result<rmcp::model::CallToolResponse, rmcp::model::ErrorData> {
+        if let Some(token) = context.meta.get_progress_token() {
+            for step in 1..=3u32 {
+                let param = rmcp::model::ProgressNotificationParam::new(token.clone(), step as f64)
+                    .with_total(3.0)
+                    .with_message(format!("step {step}"));
+                let _ = context.peer.notify_progress(param).await;
+            }
+        }
+        // Свой токен фикстура НАЗЫВАЕТ в ответе: тест обязан убедиться, что
+        // он отличается от клиентского, иначе проверка перевода вырождается
+        // в тавтологию (счётчики токенов у разных пиров начинаются с нуля и
+        // легко совпадают).
+        let token_note = match context.meta.get_progress_token() {
+            Some(t) => format!("done token={t:?}"),
+            None => "done token=none".to_string(),
+        };
+        let mut result =
+            rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(token_note)]);
+        result.result_type = Some(rmcp::model::ResultType::COMPLETE);
+        Ok(rmcp::model::CallToolResponse::Complete(result))
+    }
+}

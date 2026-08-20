@@ -49,14 +49,19 @@ pub async fn run(config: Config, options: RunOptions) -> Result<(), ProxyError> 
     // пока подключится настоящий клиент. Иначе никак — `Peer<RoleServer>`
     // рождается только в момент `serve`, то есть заведомо позже.
     let upstream = downstream::UpstreamSlot::new();
+    // Мост progress-токенов общий: его наполняет гейтвей на каждом вызове, а
+    // читают обработчики всех downstream'ов.
+    let progress = downstream::ProgressBridge::new();
 
     // Eager parallel spawn (T6.4): опоздавшие/упавшие не валят остальных.
     let mut join_set = tokio::task::JoinSet::new();
     for (name, server_config) in config.servers.clone() {
         let slot = upstream.clone();
+        let bridge = progress.clone();
         join_set.spawn(async move {
             let result =
-                spawn::spawn_downstream(&name, &server_config, initialize_timeout, slot).await;
+                spawn::spawn_downstream(&name, &server_config, initialize_timeout, slot, bridge)
+                    .await;
             (name, result)
         });
     }
@@ -137,6 +142,7 @@ pub async fn run(config: Config, options: RunOptions) -> Result<(), ProxyError> 
             passthrough: options.passthrough,
             log_args: config.log.log_args,
             canon,
+            progress,
         },
     );
     let service = gateway

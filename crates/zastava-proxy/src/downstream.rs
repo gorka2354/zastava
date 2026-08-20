@@ -22,14 +22,16 @@
 // поступает так же (`#![expect(deprecated)]` в service/server.rs).
 #![allow(deprecated)]
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rmcp::handler::client::ClientHandler;
 use rmcp::model::{
     CreateMessageRequestParams, CreateMessageResult, ElicitRequestParams, ElicitResult, ErrorData,
-    ListRootsResult,
+    ListRootsResult, ProgressNotificationParam, ProgressToken,
 };
-use rmcp::service::{Peer, RequestContext, RoleClient, RoleServer};
+use rmcp::service::{NotificationContext, Peer, RequestContext, RoleClient, RoleServer};
 use tokio::sync::watch;
 
 /// Слот с пиром НАСТОЯЩЕГО клиента.
@@ -92,6 +94,94 @@ impl UpstreamSlot {
     }
 }
 
+/// Мост прогресса: соответствие токенов downstream'а и клиента.
+///
+/// Нужен из-за того, как rmcp устроен внутри: отправляя запрос вниз, он
+/// БЕЗУСЛОВНО подставляет собственный progress-токен — прокинуть клиентский
+/// нельзя. Downstream шлёт уведомления на свой токен, а клиент ждёт свой, и
+/// без перевода прогресс либо теряется, либо адресуется в пустоту.
+///
+/// Заодно это граница доверия: downstream может прислать уведомление на ЧУЖОЙ
+/// токен (свой или выдуманный). Незарегистрированный токен просто не имеет
+/// соответствия и дальше не идёт — подделать чужой прогресс нельзя.
+#[derive(Clone, Default)]
+pub struct ProgressBridge {
+    relays: Arc<Mutex<HashMap<ProgressToken, Relay>>>,
+}
+
+impl std::fmt::Debug for ProgressBridge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Содержимое не печатаем: там пиры и токены живых вызовов.
+        f.write_str("ProgressBridge")
+    }
+}
+
+#[derive(Clone)]
+struct Relay {
+    client_token: ProgressToken,
+    client: Peer<RoleServer>,
+}
+
+impl ProgressBridge {
+    /// Пустой мост.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Связывает токен downstream'а с токеном клиента на время вызова.
+    ///
+    /// Возвращает страж: соответствие снимается на ЛЮБОМ выходе из вызова —
+    /// успех, ошибка, таймаут, отмена. Без этого карта росла бы вечно.
+    pub fn register(
+        &self,
+        downstream_token: ProgressToken,
+        client_token: ProgressToken,
+        client: Peer<RoleServer>,
+    ) -> ProgressGuard {
+        self.relays.lock().expect("progress lock poisoned").insert(
+            downstream_token.clone(),
+            Relay {
+                client_token,
+                client,
+            },
+        );
+        ProgressGuard {
+            bridge: self.clone(),
+            token: downstream_token,
+        }
+    }
+
+    /// Переводит уведомление downstream'а клиенту. Молча игнорирует
+    /// незнакомый токен.
+    async fn relay(&self, mut params: ProgressNotificationParam) {
+        let relay = {
+            let map = self.relays.lock().expect("progress lock poisoned");
+            map.get(&params.progress_token).cloned()
+        };
+        let Some(relay) = relay else { return };
+        params.progress_token = relay.client_token;
+        if let Err(e) = relay.client.notify_progress(params).await {
+            tracing::debug!(error = %e, "could not relay progress to the client");
+        }
+    }
+}
+
+/// Снимает соответствие токенов, когда вызов закончился.
+pub struct ProgressGuard {
+    bridge: ProgressBridge,
+    token: ProgressToken,
+}
+
+impl Drop for ProgressGuard {
+    fn drop(&mut self) {
+        self.bridge
+            .relays
+            .lock()
+            .expect("progress lock poisoned")
+            .remove(&self.token);
+    }
+}
+
 /// Обработчик клиент-роли для одного downstream-сервера.
 #[derive(Clone)]
 pub struct DownstreamHandler {
@@ -100,14 +190,26 @@ pub struct DownstreamHandler {
     /// Пир настоящего клиента; заполняется после его подключения.
     #[allow(dead_code)] // задействуется в W4 (пересылка обратных запросов)
     upstream: UpstreamSlot,
+    /// Перевод progress-токенов между downstream'ом и клиентом.
+    progress: ProgressBridge,
 }
 
 impl DownstreamHandler {
     /// Создаёт обработчик для сервера `name`.
     pub fn new(name: impl Into<String>, upstream: UpstreamSlot) -> Self {
+        Self::with_progress(name, upstream, ProgressBridge::new())
+    }
+
+    /// Тот же обработчик, но с общим мостом прогресса.
+    pub fn with_progress(
+        name: impl Into<String>,
+        upstream: UpstreamSlot,
+        progress: ProgressBridge,
+    ) -> Self {
         Self {
             name: name.into(),
             upstream,
+            progress,
         }
     }
 
@@ -160,6 +262,16 @@ impl ClientHandler for DownstreamHandler {
         // Дефолт rmcp вернул бы Ok(Decline) — отказ от имени человека,
         // которого никто не спрашивал.
         Err(self.not_forwarded("elicitation/create"))
+    }
+
+    async fn on_progress(
+        &self,
+        params: ProgressNotificationParam,
+        _context: NotificationContext<RoleClient>,
+    ) {
+        // Уведомление — не запрос: отвечать некому и ждать нечего. Просто
+        // переводим токен и отправляем дальше.
+        self.progress.relay(params).await;
     }
 }
 
