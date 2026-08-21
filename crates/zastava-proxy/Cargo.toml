@@ -1,6 +1,9 @@
 [package]
 name = "zastava-proxy"
 description = "Zastava MCP wiring: rmcp server+client, downstream spawn/lifecycle, routing."
+keywords = ["mcp", "proxy", "gateway"]
+categories = ["development-tools"]
+readme = "../../README.md"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -6,7 +6,7 @@ members = ["crates/zastava-core", "crates/zastava-proxy", "crates/zastava-cli"]
 exclude = ["spike"]
 
 [workspace.package]
-version = "0.1.0-dev"
+version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT"
@@ -14,8 +14,8 @@ repository = "https://github.com/gorka2354/zastava"
 authors = ["gorka2354"]
 
 [workspace.dependencies]
-zastava-core = { path = "crates/zastava-core", version = "0.1.0-dev" }
-zastava-proxy = { path = "crates/zastava-proxy", version = "0.1.0-dev" }
+zastava-core = { path = "crates/zastava-core", version = "0.1.0" }
+zastava-proxy = { path = "crates/zastava-proxy", version = "0.1.0" }
 thiserror = "2"
 serde_json = "1"
 sha2 = "0.10"

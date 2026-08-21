@@ -1,6 +1,9 @@
 [package]
 name = "zastava-core"
 description = "Zastava domain core: config model, policy types, signatures. No IO."
+keywords = ["mcp", "policy", "audit"]
+categories = ["development-tools"]
+readme = "../../README.md"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
