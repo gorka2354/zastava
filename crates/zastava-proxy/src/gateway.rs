@@ -371,9 +371,11 @@ impl Gateway {
             name_sanitized: server_dirty || tool_dirty,
             canon_version: CANON_VERSION,
             args_hash: full_args_hash(args),
-            // Полные аргументы — только по явному опт-ину: до маскировки
-            // секретов (M4) сюда попадёт всё, включая токены.
-            args: self.log_args.then(|| Value::Object(args.clone())),
+            // Полные аргументы — только по явному опт-ину, и всегда через
+            // маскировку: журнал долгоживущий и лежит на диске открытым
+            // текстом, а токен в аргументах ничем не отличается от токена в
+            // файле `.env`.
+            args: self.log_args.then(|| zastava_core::mask::mask_args(args)),
             decision: decision_str.to_string(),
             enforced,
             matched_rule,

@@ -1319,3 +1319,69 @@ async fn a_call_that_goes_silent_is_still_cut_off() {
         "причина обязана быть названа: таймаут и смерть сервера — разные факты"
     );
 }
+
+#[tokio::test]
+async fn full_args_reach_the_journal_masked() {
+    // `log_args` — единственное место, где в журнал попадают аргументы
+    // целиком, и до M4 оно писало их как есть. Проверка здесь, а не только
+    // юнит-тестом маскировки: важно, что гейтвей зовёт маскировку ВООБЩЕ,
+    // а не что функция работает в отрыве от него.
+    let config = Config::from_toml_str(ENFORCE_ALLOW_ALL).expect("test config");
+    let mut downstreams = HashMap::new();
+    downstreams.insert("alpha".to_string(), fixture_downstream("alpha").await);
+
+    let log_dir = tempfile::tempdir().expect("tempdir");
+    let log_path = log_dir.path().join("calls.jsonl");
+    let log = logger::start(log_path.clone(), logger::DEFAULT_MAX_LOG_BYTES);
+
+    let gateway = Gateway::with_options(
+        downstreams,
+        Arc::new(RwLock::new(PolicyEngine::from_config(&config.policy))),
+        Some(log),
+        Duration::from_millis(5_000),
+        Duration::from_millis(2_000),
+        GatewayOptions {
+            log_args: true,
+            ..GatewayOptions::default()
+        },
+    );
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        if let Ok(running) = gateway.serve(server_io).await {
+            let _ = running.waiting().await;
+        }
+    });
+    let client = ().serve(client_io).await.expect("gateway client");
+
+    let _ = client
+        .call_tool(call(
+            "alpha__echo",
+            serde_json::json!({
+                "repo": "gorka2354/zastava",
+                "github_token": "ghp_ZzYyXxWw112233",
+                "dsn": "postgres://svc:hunter2@db.internal/prod"
+            }),
+        ))
+        .await
+        .expect("вызов проходит");
+
+    let records = wait_records(&log_path, 1).await;
+    let record = records.iter().find(|r| r.is_call()).expect("запись вызова");
+    let args = record
+        .args
+        .as_ref()
+        .expect("аргументы записаны")
+        .to_string();
+    assert!(!args.contains("ghp_ZzYyXxWw"), "токен в журнале: {args}");
+    assert!(!args.contains("hunter2"), "пароль из DSN в журнале: {args}");
+    assert!(
+        args.contains("gorka2354/zastava"),
+        "полезное обязано остаться, иначе опция бессмысленна: {args}"
+    );
+    // Сырой JSON-RPC до гейтвея всё-таки нёс секрет — значит журнал сузился
+    // именно на нашей стороне, а не «фикстура не передала».
+    assert!(
+        args.contains("db.internal/prod"),
+        "адрес без учётных данных: {args}"
+    );
+}

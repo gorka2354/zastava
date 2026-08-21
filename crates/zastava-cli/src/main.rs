@@ -232,8 +232,9 @@ fn check(path: &Path) -> anyhow::Result<()> {
     }
     println!("  log:     {}", resolve_log_path(&config).display());
     if config.log.log_args {
-        println!("  WARNING log_args = true: в журнал пишутся ПОЛНЫЕ аргументы вызовов;");
-        println!("          до маскировки секретов (M4) туда попадут и токены.");
+        println!("  WARNING log_args = true: в журнал пишутся аргументы вызовов");
+        println!("          (секреты маскируются эвристически — не полагайтесь на это");
+        println!("           как на гарантию: журнал станет чувствительным файлом).");
     }
     Ok(())
 }

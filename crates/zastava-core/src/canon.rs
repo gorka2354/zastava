@@ -231,45 +231,11 @@ fn normalize_url(raw: &str) -> Option<String> {
     Some(format!("{scheme}://{host}"))
 }
 
-/// Грубая проверка «похоже на секрет»: длинная строка без структуры и с
-/// высоким разнообразием символов. Лучше отвергнуть настоящий идентификатор
-/// (правило просто станет tool-level), чем записать в журнал токен.
-fn looks_like_secret(value: &str) -> bool {
-    const SECRET_MIN_LEN: usize = 20;
-    let candidate = value.trim();
-    if candidate.len() < SECRET_MIN_LEN {
-        return false;
-    }
-    // Структурированное значение (путь, URL, фраза) — не секрет. Проверяем
-    // ПОСЛЕ нормализации, поэтому у URL здесь уже нет ни пути, ни userinfo.
-    if candidate.contains('/') || candidate.contains('\\') || candidate.contains(' ') {
-        return false;
-    }
-
-    // Длинная сплошная hex-строка — ключ, сессия или хэш. Прежняя эвристика
-    // требовала смешанного регистра И цифры, и такие значения пропускала.
-    let hexish = candidate
-        .chars()
-        .filter(|c| c.is_ascii_hexdigit() || *c == '-')
-        .count();
-    if hexish == candidate.len()
-        && candidate.chars().filter(char::is_ascii_hexdigit).count() >= SECRET_MIN_LEN
-    {
-        return true;
-    }
-
-    let distinct: BTreeSet<char> = candidate.chars().collect();
-    let alnum = candidate
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .count();
-    let has_digit = candidate.chars().any(|c| c.is_ascii_digit());
-    let has_letter = candidate.chars().any(|c| c.is_ascii_alphabetic());
-    // Длинная «каша» из букв и цифр без разделителей — типичный токен.
-    // Требование смешанного регистра снято: `AKIAIOSFODNN7EXAMPLE` и
-    // `ghp_...` в одном регистре — такие же секреты (находка ревью M3).
-    alnum * 10 >= candidate.len() * 9 && distinct.len() >= 10 && has_digit && has_letter
-}
+/// Правило «похоже на секрет» — общее с маскировкой ([`crate::mask`]).
+///
+/// Держать здесь свою копию было бы прямой дырой: значение, отвергнутое
+/// канонизацией, спокойно прошло бы через маскировку, и наоборот.
+use crate::mask::looks_like_secret;
 
 #[cfg(test)]
 mod tests {
