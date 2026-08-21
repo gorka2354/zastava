@@ -156,6 +156,28 @@ fn events_shows_ids_that_annotate_accepts() {
 }
 
 #[test]
+fn events_show_what_the_call_asked_for() {
+    // «Правило спасло или мешает» решается по аргументу, а не по имени
+    // инструмента: список отказов без пути отвечает не на тот вопрос.
+    let journal = call(
+        "ev-ccc",
+        "read_text_file",
+        "{\"path\":\"/home/u/proj/.secrets/…\"}",
+        "deny",
+        true,
+    );
+    let (_dir, config) = workspace(
+        "[servers.fs]
+command = \"node\"
+",
+        &journal,
+    );
+    zastava(&config, &["events", "--denied"])
+        .success()
+        .stdout(predicate::str::contains("path=/home/u/proj/.secrets/…"));
+}
+
+#[test]
 fn learn_prints_the_narrowing_and_warns_that_warn_mode_blocks_nothing() {
     let subset = "{\"path\":\"C:/work/zastava/src/…\"}";
     let journal = format!(

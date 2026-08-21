@@ -324,6 +324,20 @@ fn events(path: &Path, limit: usize, denied_only: bool) -> anyhow::Result<()> {
             Some(reason) => format!("{what}  ({reason})"),
             None => what,
         };
+        // Канонические аргументы прямо в строке. Без них список отказов
+        // отвечает «какой инструмент», но не «что он хотел» — а решение
+        // «правило спасло или мешает» принимается ровно по второму.
+        let what = if record.canonical_subset.is_empty() {
+            what
+        } else {
+            let args = record
+                .canonical_subset
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!("{what}  {args}")
+        };
         println!(
             "{:<24} {:<20} {:<10} {}",
             record.id,
