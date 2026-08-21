@@ -4,6 +4,11 @@ description = "MCP gateway with argument-level policies, audit log and rule lear
 keywords = ["mcp", "ai", "security", "policy", "gateway"]
 categories = ["command-line-utilities", "development-tools"]
 readme = "../../README.md"
+# В пакет НЕ едут тестовая фикстура и тесты. Иначе `cargo install zastava`
+# кладёт пользователю в PATH ещё и `zastava-test-echo` — эхо-MCP-сервер,
+# который нужен только нашим e2e (замечено на проверке 0.1.0 с чистой
+# машины). Бенч остаётся: он часть обещания «замерь сам».
+exclude = ["src/bin/", "tests/"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
