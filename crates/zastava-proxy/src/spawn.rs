@@ -40,7 +40,12 @@ pub async fn spawn_downstream(
     initialize_timeout: Duration,
     shared: Shared,
 ) -> Result<Downstream, ProxyError> {
+    // Время старта каждого сервера — не диагностика ради диагностики: старт
+    // гейтвея равен старту САМОГО МЕДЛЕННОГО downstream'а, и без этой цифры
+    // «Застава тормозит при запуске» неотличимо от «npx поднимается 700 мс».
+    let started = std::time::Instant::now();
     let (transport, stderr) = spawn_transport(name, config)?;
+    let spawned = started.elapsed();
     drain_stderr(name, stderr);
 
     let handler = DownstreamHandler::new(name, shared);
@@ -55,7 +60,12 @@ pub async fn spawn_downstream(
             message: e.to_string(),
         })?;
 
-    tracing::info!(server = name, "downstream up");
+    tracing::info!(
+        server = name,
+        spawn_ms = spawned.as_millis() as u64,
+        ready_ms = started.elapsed().as_millis() as u64,
+        "downstream up"
+    );
     Ok(Downstream {
         name: name.to_string(),
         service,

@@ -15,6 +15,12 @@ authors.workspace = true
 name = "zastava"
 path = "src/main.rs"
 
+# Замеры M4. harness = false — цифры печатаются как отчёт, а не гоняются
+# через libtest: нам нужен один прогон с разбором, а не «прошло/упало».
+[[bench]]
+name = "latency"
+harness = false
+
 [dependencies]
 zastava-core.workspace = true
 zastava-proxy.workspace = true
