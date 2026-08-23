@@ -29,7 +29,11 @@ impl Resolved {
             return self.root.clone();
         }
         let joined = self.components.join("/");
-        if self.root.is_empty() || self.root.ends_with('/') {
+        // У корня `file://` authority пустой, и хвостовые слеши принадлежат
+        // самой схеме, а не разделяют компоненты — без отдельного слеша
+        // `file:///C:/work` собиралось бы обратно как `file://C:/work`.
+        let root_is_separator = self.root.ends_with('/') && !self.root.ends_with("://");
+        if self.root.is_empty() || root_is_separator {
             format!("{}{joined}", self.root)
         } else {
             // URL-корень хранится без хвостового слеша: `https://host`.
@@ -129,7 +133,35 @@ fn url_root(raw: &str) -> Option<(String, &str)> {
     if authority.contains('\\') {
         return None;
     }
+    // URL без хоста (`file:///C:/work/proj`): буква диска принадлежит КОРНЮ,
+    // а не пути — ровно как в обычном `C:/work/proj`. Иначе один и тот же
+    // путь получал бы разный вердикт в зависимости от записи: `..` спокойно
+    // перешагивал бы через диск внутри file-URL, хотя в обычном пути такой
+    // выход за корень отвергается, — и усечение считалось бы от другого места.
+    if authority.is_empty() {
+        if let Some(drive_end) = windows_drive_len(rest) {
+            let (drive, tail) = rest.split_at(drive_end);
+            return Some((format!("{scheme}://{authority}{drive}"), tail));
+        }
+    }
     Some((format!("{scheme}://{authority}"), rest))
+}
+
+/// Длина префикса `/C:` в начале пути URL, если он там есть.
+fn windows_drive_len(rest: &str) -> Option<usize> {
+    let bytes = rest.as_bytes();
+    let looks_like_drive =
+        bytes.len() >= 3 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b':';
+    looks_like_drive.then_some(3)
+}
+
+/// Кончается ли корень буквой диска — `file:///C:`.
+fn ends_with_drive(root: &str) -> bool {
+    let b = root.as_bytes();
+    b.len() >= 3
+        && b[b.len() - 1] == b':'
+        && b[b.len() - 2].is_ascii_alphabetic()
+        && b[b.len() - 3] == b'/'
 }
 
 /// Отделяет корень от остатка (для не-URL значений).
@@ -166,7 +198,9 @@ impl Resolved {
 
     /// Windows-пространство имён, где регистр не различается целиком.
     fn is_windows_namespace(&self) -> bool {
-        self.root.ends_with(":/") || self.root == "//"
+        // `file:///C:` — то же пространство имён, что и `C:/`, и регистр в
+        // нём не различается точно так же.
+        self.root.ends_with(":/") || self.root == "//" || ends_with_drive(&self.root)
     }
 
     /// Ключ для сравнения префиксов.

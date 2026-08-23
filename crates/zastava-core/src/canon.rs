@@ -216,6 +216,14 @@ fn normalize_path(raw: &str) -> Option<String> {
 /// Userinfo (`user:password@`) вырезается: это самая чувствительная часть
 /// URL, и она единственная переживала нормализацию, попадая в журнал
 /// открытым текстом (P1 ревью M3).
+///
+/// Исключение — URL без хоста (`file:///C:/work/proj/page.html`). Там адрес
+/// ресурса несёт именно путь, и правило «оставить схему и хост» не оставляло
+/// ничего: значение целиком уходило в `<rejected>`. Найдено на живом журнале
+/// недельного эксперимента, и цена оказалась двойной — из аудита пропадал
+/// путь к файлу, а `learn` из-за пяти таких записей вовсе отказывался
+/// предлагать сужение для `browser_navigate`, хотя 111 URL из 116 записались
+/// нормально.
 fn normalize_url(raw: &str) -> Option<String> {
     let (scheme, rest) = raw.split_once("://")?;
     let authority_len = rest.find(['/', '?', '#']).unwrap_or(rest.len());
@@ -226,7 +234,10 @@ fn normalize_url(raw: &str) -> Option<String> {
         None => authority,
     };
     if host.is_empty() {
-        return None;
+        // Хоста нет — значит адрес в пути. Усекаем его теми же правилами,
+        // что и обычный путь: обход `..` по-прежнему отвергается, потому что
+        // разбор идёт через ту же `pathish::resolve`.
+        return normalize_path(raw);
     }
     Some(format!("{scheme}://{host}"))
 }
@@ -464,5 +475,78 @@ mod tests {
         let rules = CanonRules::from_config(&config.canon);
         let subset = rules.subset("a", "t", &args(&[("room", "general")]));
         assert_eq!(subset["room"], "general");
+    }
+
+    #[test]
+    fn a_file_url_keeps_its_path_instead_of_vanishing() {
+        // Найдено на живом журнале: у file-URL нет хоста, и правило «схема +
+        // хост» не оставляло ничего — путь к файлу пропадал из аудита
+        // целиком, а learn переставал сужать navigate из-за таких записей.
+        //
+        // Проверяется не просто «что-то записалось», а РАВЕНСТВО обычному
+        // пути: одно и то же место, записанное двумя способами, обязано
+        // давать в журнале одно и то же.
+        let rules = CanonRules::default();
+        let canon = |value: &str| {
+            rules
+                .subset("playwright", "browser_navigate", &args(&[("url", value)]))
+                .get("url")
+                .cloned()
+        };
+        let as_path = |value: &str| {
+            rules
+                .subset("fs", "read_file", &args(&[("path", value)]))
+                .get("path")
+                .cloned()
+        };
+
+        assert_eq!(
+            canon("file:///C:/work/proj/page.html").as_deref(),
+            Some("file:///C:/work/proj/page.html")
+        );
+        // Глубокий путь усекается — и ровно там же, где усёкся бы обычный.
+        assert_eq!(
+            canon("file:///C:/work/proj/src/deep/page.html").as_deref(),
+            Some(format!("file:///C:/work/proj/src{TRUNCATION_MARK}").as_str())
+        );
+        assert_eq!(
+            as_path("C:/work/proj/src/deep/page.html").as_deref(),
+            Some(format!("C:/work/proj/src{TRUNCATION_MARK}").as_str())
+        );
+        // На unix-пути диска нет, корень — сам `file://`.
+        assert_eq!(
+            canon("file:///home/u/proj/page.html").as_deref(),
+            Some(format!("file:///home/u/proj{TRUNCATION_MARK}").as_str())
+        );
+    }
+
+    #[test]
+    fn a_file_url_that_escapes_its_root_is_still_refused() {
+        // Послабление для file:// не должно открывать обход. Буква диска
+        // принадлежит корню, поэтому `..` через неё — выход за корень, ровно
+        // как в обычном пути.
+        let rules = CanonRules::default();
+        let out = rules.subset(
+            "playwright",
+            "browser_navigate",
+            &args(&[("url", "file:///C:/work/../../Windows/System32/config")]),
+        );
+        assert_eq!(out.get("url").map(String::as_str), Some(REJECTED_MARK));
+    }
+
+    #[test]
+    fn an_ordinary_url_still_loses_its_path() {
+        // Обратная сторона: у http(s) путь — это данные запроса, и он в
+        // журнал по-прежнему не едет.
+        let rules = CanonRules::default();
+        let out = rules.subset(
+            "playwright",
+            "browser_navigate",
+            &args(&[("url", "https://api.example.com/v1/users/42?token=abc")]),
+        );
+        assert_eq!(
+            out.get("url").map(String::as_str),
+            Some("https://api.example.com")
+        );
     }
 }
